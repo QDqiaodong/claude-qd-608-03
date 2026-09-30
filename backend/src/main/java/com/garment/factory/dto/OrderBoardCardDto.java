@@ -5,7 +5,7 @@ import java.time.LocalDate;
 import java.util.Map;
 
 /**
- * 订单进度看板卡片：列表投影用；工序完成情况在 service 里另行汇总填充。
+ * 订单进度看板卡片：列表投影用；工序完成情况、量体冻结口径在 service 里另行汇总填充。
  */
 public class OrderBoardCardDto {
 
@@ -15,7 +15,7 @@ public class OrderBoardCardDto {
     private final String styleName;
     private final String fabricName;
     private final String colorHex;
-    private final String tailorName;
+    private final Long measurementId;
     private final LocalDate deliveryDate;
     private final BigDecimal totalPrice;
     private final BigDecimal usageMeters;
@@ -27,11 +27,14 @@ public class OrderBoardCardDto {
     /** 已完成工单数（服务层回填） */
     private long workOrderDone;
 
+    /** 量体冻结口径（服务层回填：看板卡片与点开后的工序抽屉同一份数据） */
+    private OrderMeasurementView measurement;
+
     /** 试衣整改汇总（服务层回填：未关闭数/阻断数/返修轮次/当前阶段） */
     private Map<String, Object> fitting;
 
     public OrderBoardCardDto(Long id, String orderNo, String customerName, String styleName, String fabricName,
-                             String colorHex, String tailorName, LocalDate deliveryDate, BigDecimal totalPrice,
+                             String colorHex, Long measurementId, LocalDate deliveryDate, BigDecimal totalPrice,
                              BigDecimal usageMeters, String status, Boolean balancePaid) {
         this.id = id;
         this.orderNo = orderNo;
@@ -39,7 +42,7 @@ public class OrderBoardCardDto {
         this.styleName = styleName;
         this.fabricName = fabricName;
         this.colorHex = colorHex;
-        this.tailorName = tailorName;
+        this.measurementId = measurementId;
         this.deliveryDate = deliveryDate;
         this.totalPrice = totalPrice;
         this.usageMeters = usageMeters;
@@ -71,8 +74,8 @@ public class OrderBoardCardDto {
         return colorHex;
     }
 
-    public String getTailorName() {
-        return tailorName;
+    public Long getMeasurementId() {
+        return measurementId;
     }
 
     public LocalDate getDeliveryDate() {
@@ -109,6 +112,14 @@ public class OrderBoardCardDto {
 
     public void setWorkOrderDone(long workOrderDone) {
         this.workOrderDone = workOrderDone;
+    }
+
+    public OrderMeasurementView getMeasurement() {
+        return measurement;
+    }
+
+    public void setMeasurement(OrderMeasurementView measurement) {
+        this.measurement = measurement;
     }
 
     public Map<String, Object> getFitting() {

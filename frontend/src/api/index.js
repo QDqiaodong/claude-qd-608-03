@@ -21,6 +21,11 @@ request.interceptors.response.use(
   },
   (error) => {
     const detail = error?.response?.data
+    const status = error?.response?.status
+    // 409 并发竞争交由调用方处理（如下单需提示重新选择量体），不统一弹错
+    if (status === 409) {
+      return Promise.reject(new Error(detail?.message || '操作冲突，请刷新后重试'))
+    }
     ElMessage.error((detail && detail.message) || error.message || '请求失败')
     return Promise.reject(error)
   }
@@ -60,11 +65,14 @@ export const orderApi = {
   list: (params) => request.get('/orders', { params }),
   board: () => request.get('/orders/board'),
   customers: () => request.get('/orders/customers'),
+  detail: (id) => request.get(`/orders/${id}`),
   preview: (data) => request.post('/orders/price-preview', data),
   create: (data) => request.post('/orders', data),
   advance: (id, payload) => request.post(`/orders/${id}/advance`, payload || {}),
   payBalance: (id) => request.post(`/orders/${id}/balance-pay`),
-  remove: (id) => request.delete(`/orders/${id}`)
+  remove: (id) => request.delete(`/orders/${id}`),
+  backfillSnapshots: () => request.post('/orders/measurement-snapshots/backfill'),
+  confirmMeasurement: (id, data) => request.post(`/orders/${id}/measurement-confirm`, data)
 }
 
 export const workOrderApi = {

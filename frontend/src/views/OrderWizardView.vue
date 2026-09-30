@@ -74,7 +74,15 @@
         <el-tabs v-model="measureMode">
           <el-tab-pane label="复用历史量体" name="history">
             <div v-if="historyList.length === 0" class="gf-empty">该客户暂无历史量体记录，请切换到「现场录入」</div>
-            <el-radio-group v-else v-model="order.measurementId" class="msr-radio">
+            <el-alert
+              v-if="historyList.length > 0"
+              type="info"
+              :closable="false"
+              show-icon
+              style="margin-bottom: 10px"
+              title="下单确认后将冻结所选量体的完整尺寸；今后该量体记录再编辑或删除，都不会改变本订单"
+            />
+            <el-radio-group :model-value="order.measurementId" class="msr-radio" @change="onHistoryPick">
               <el-radio v-for="m in historyList" :key="m.id" :value="m.id" class="msr-item">
                 <div class="msr-line">
                   <b>{{ m.recordNo }}</b>
@@ -272,7 +280,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { metaApi, orderApi, styleApi, fabricApi, measurementApi } from '../api/index.js'
 import { yuan, num, day, todayStr, addDaysStr, daysFromToday } from '../utils/format.js'
@@ -302,6 +310,7 @@ const submitting = ref(false)
 
 const order = reactive({
   measurementId: null,
+  expectedMeasurementVersion: null,
   usageMeters: 3.6,
   deliveryDate: addDaysStr(21),
   payDeposit: true,
@@ -414,13 +423,24 @@ async function pickCustomer(c) {
   const list = await measurementApi.byCustomer(c.id)
   historyList.value = list
   if (list.length > 0) {
-    order.measurementId = list[0].id
+    pickHistory(list[0])
     measureMode.value = 'history'
   } else {
     order.measurementId = null
+    order.expectedMeasurementVersion = null
     measureMode.value = 'new'
   }
   msr.recordNo = `ME-${4013 + Math.floor(Math.random() * 500)}`
+}
+
+function pickHistory(m) {
+  order.measurementId = m.id
+  order.expectedMeasurementVersion = m.version
+}
+
+function onHistoryPick(id) {
+  const hit = historyList.value.find((m) => m.id === id)
+  if (hit) pickHistory(hit)
 }
 
 async function pickStyle(s) {
@@ -475,11 +495,30 @@ async function submit() {
       payDeposit: order.payDeposit,
       remark: order.remark,
       measurementId: measureMode.value === 'history' ? order.measurementId : null,
+      expectedMeasurementVersion: measureMode.value === 'history'
+        ? order.expectedMeasurementVersion
+        : null,
       measurement: measureMode.value === 'new' ? { ...msr, customerId: customer.value.id } : null
     }
     const created = await orderApi.create(payload)
-    ElMessage.success(`订单 ${created.orderNo} 已建立`)
+    ElMessage.success(`订单 ${created.orderNo} 已建立，量体尺寸已冻结`)
     router.push('/board')
+  } catch (e) {
+    // 409：量体记录在下单期间被编辑/删除，明确要求重新选择，绝不写半份快照
+    if (e?.response?.status === 409) {
+      await ElMessageBox.alert(e.message, '量体记录已变化，请重新选择', { type: 'warning' })
+      if (measureMode.value === 'history') {
+        const list = await measurementApi.byCustomer(customer.value.id)
+        historyList.value = list
+        const stillExists = list.find((m) => m.id === order.measurementId)
+        if (!stillExists) {
+          order.measurementId = null
+          order.expectedMeasurementVersion = null
+        } else {
+          pickHistory(stillExists)
+        }
+      }
+    }
   } finally {
     submitting.value = false
   }

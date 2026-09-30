@@ -55,6 +55,21 @@
             <el-tag v-else size="small" type="success">正常</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="订单引用" min-width="200">
+          <template #default="{ row }">
+            <div v-if="(row.activeOrders || []).length" style="display:flex;flex-direction:column;gap:2px">
+              <el-tag v-for="o in row.activeOrders" :key="o.orderId" size="small" type="warning" effect="plain">
+                {{ o.orderNo }} · {{ statusName(o.orderStatus) }}
+              </el-tag>
+              <span class="gf-muted" style="font-size:11.5px">未交付：改尺寸不影响这些订单，删除会被拦截</span>
+            </div>
+            <div v-else-if="row.deliveredOrderCount > 0" style="display:flex;flex-direction:column;gap:2px">
+              <el-tag size="small" type="info" effect="plain">仅 {{ row.deliveredOrderCount }} 笔已交付订单引用</el-tag>
+              <span class="gf-muted" style="font-size:11.5px">历史订单已留存冻结尺寸，可删除原记录</span>
+            </div>
+            <span v-else class="gf-muted" style="font-size: 12px">未被订单引用</span>
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="140" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
@@ -118,6 +133,25 @@
           <el-input v-model="form.remark" type="textarea" :rows="2" placeholder="版型偏好 / 特殊体型说明" />
         </el-form-item>
       </el-form>
+
+      <el-alert
+        v-if="form.id && editingActiveOrders.length"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-top: 4px"
+        title="该量体记录正被未交付订单使用"
+        :description="`保存后只影响以后新选这条记录的订单；以下 ${editingActiveOrders.length} 笔订单已在确认时冻结尺寸，不会随本次修改变化：` + editingActiveOrders.map((o) => `${o.orderNo}（${statusName(o.orderStatus)}）`).join('、')"
+      />
+      <el-alert
+        v-else-if="form.id && form.deliveredOrderCount > 0"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-top: 4px"
+        :title="`该记录仅被 ${form.deliveredOrderCount} 笔已交付订单引用，历史订单展示的是各自冻结的尺寸，不受编辑影响`"
+      />
+
       <template #footer>
         <el-button @click="drawer = false">取消</el-button>
         <el-button type="primary" :loading="saving" @click="submit">保存</el-button>
@@ -127,12 +161,12 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { measurementApi, metaApi, orderApi } from '../api/index.js'
 import { day, num, todayStr } from '../utils/format.js'
 
-const dict = reactive({ partRange: {} })
+const dict = reactive({ partRange: {}, orderStatuses: {} })
 const query = reactive({ customerId: null, tailorName: '' })
 const customers = ref([])
 const tailors = ref([])
@@ -144,6 +178,10 @@ const loading = ref(false)
 const saving = ref(false)
 const drawer = ref(false)
 const openPanels = ref(['upper', 'lower'])
+
+function statusName(code) {
+  return dict.orderStatuses[code] || code
+}
 
 const parts = [
   { key: 'bust', name: '胸围' },
@@ -182,7 +220,10 @@ function blankForm() {
     sleeveLength: 57,
     bodyLength: 62,
     pantsLength: 96,
-    remark: ''
+    remark: '',
+    version: null,
+    activeOrders: [],
+    deliveredOrderCount: 0
   }
 }
 
@@ -199,6 +240,8 @@ function inRange(row, key) {
 function abnormal(row) {
   return parts.some((p) => !inRange(row, p.key))
 }
+
+const editingActiveOrders = computed(() => form.activeOrders || [])
 
 async function fetchPage(reset) {
   if (reset) {
@@ -253,7 +296,10 @@ function openEdit(row) {
     sleeveLength: Number(row.sleeveLength),
     bodyLength: Number(row.bodyLength),
     pantsLength: Number(row.pantsLength),
-    remark: row.remark
+    remark: row.remark,
+    version: row.version,
+    activeOrders: row.activeOrders || [],
+    deliveredOrderCount: row.deliveredOrderCount || 0
   })
   drawer.value = true
 }
@@ -271,7 +317,26 @@ async function submit() {
 }
 
 async function remove(row) {
-  await ElMessageBox.confirm(`确认删除量体单「${row.recordNo}」？`, '删除确认', { type: 'warning' })
+  const active = row.activeOrders || []
+  if (active.length) {
+    // 编辑/删除/查看三条链路中的删除链路：前端先明确告知阻断来源，服务端仍会再次拒绝
+    await ElMessageBox.alert(
+      `量体记录「${row.recordNo}」仍被 ${active.length} 笔未交付订单使用，不能删除：\n\n` +
+        active.map((o) => `· ${o.orderNo}（${statusName(o.orderStatus)}，客户 ${o.customerName}）`).join('\n') +
+        `\n\n这些订单的尺寸已按确认时冻结，如确需删除请先在订单侧完成交付或撤销订单。`,
+      '删除被未交付订单阻断',
+      { type: 'warning', confirmButtonText: '我知道了' }
+    )
+    return
+  }
+  const deliveredHint = row.deliveredOrderCount > 0
+    ? `\n\n该记录还被 ${row.deliveredOrderCount} 笔已交付订单引用，删除后这些订单仍会完整展示当时冻结的尺寸。`
+    : ''
+  await ElMessageBox.confirm(
+    `确认删除量体单「${row.recordNo}」？${deliveredHint}`,
+    '删除确认',
+    { type: 'warning', confirmButtonText: '确认删除' }
+  )
   await measurementApi.remove(row.id)
   ElMessage.success('已删除')
   reload()
@@ -280,6 +345,7 @@ async function remove(row) {
 onMounted(async () => {
   const meta = await metaApi.dict()
   dict.partRange = meta.partRange
+  dict.orderStatuses = meta.orderStatuses || {}
   customers.value = await orderApi.customers()
   tailors.value = await measurementApi.tailors()
   await fetchPage(true)

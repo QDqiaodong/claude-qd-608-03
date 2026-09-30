@@ -3,9 +3,12 @@
     <div class="gf-page-head">
       <div>
         <h2 class="gf-title">订单进度看板</h2>
-        <p class="gf-subtitle">横向看板：按状态分列，点开卡片可推进工序与查看工单</p>
+        <p class="gf-subtitle">横向看板：按状态分列，点开卡片可推进工序与查看工单；尺寸一律取订单确认时的冻结快照</p>
       </div>
-      <el-button type="primary" plain @click="load">刷新看板</el-button>
+      <div style="display:flex;gap:10px">
+        <el-button @click="backfill">补齐历史快照</el-button>
+        <el-button type="primary" plain @click="load">刷新看板</el-button>
+      </div>
     </div>
 
     <div class="gf-metric-row">
@@ -44,6 +47,16 @@
           <div class="style gf-muted">
             用量 {{ num(card.usageMeters, 1) }} 米 · 交期 {{ day(card.deliveryDate) }}
           </div>
+          <div class="style gf-muted" style="font-size: 12px">
+            <template v-if="card.measurement && !card.measurement.pending">
+              量体 {{ card.measurement.tailorName || '—' }} · 胸 {{ num(card.measurement.bust) }} / 腰
+              {{ num(card.measurement.waist) }} / 臀 {{ num(card.measurement.hip) }}
+              <el-tag size="small" :type="msTagType(card.measurement)" effect="plain" style="margin-left:4px">
+                {{ card.measurement.statusName }}
+              </el-tag>
+            </template>
+            <el-tag v-else size="small" type="danger" effect="plain">量体尺寸待核对</el-tag>
+          </div>
           <div class="gf-mini-bar">
             <i :style="{ width: progress(card) + '%' }" />
           </div>
@@ -81,8 +94,7 @@
             <div>
               <div style="font-weight: 600">{{ current.customerName }} · {{ current.styleName }}</div>
               <div class="gf-muted" style="font-size: 12.5px">
-                {{ current.fabricName }} · 用量 {{ num(current.usageMeters, 1) }} 米 · 量体师
-                {{ current.tailorName || '—' }}
+                {{ current.fabricName }} · 用量 {{ num(current.usageMeters, 1) }} 米
               </div>
             </div>
             <span class="spacer" style="flex: 1" />
@@ -98,6 +110,61 @@
               结清尾款
             </el-button>
           </div>
+        </div>
+
+        <!-- 冻结量体：看板 / 订单详情 / 工序侧同一份口径，刷新或重开不会退回实时记录 -->
+        <div class="gf-card" style="padding: 12px 14px; margin-bottom: 14px">
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px">
+            <h3 class="gf-section-title" style="margin:0">量体尺寸（订单冻结）</h3>
+            <el-tag size="small" :type="msTagType(current.measurement)" effect="plain">
+              {{ current.measurement?.statusName || '量体口径' }}
+            </el-tag>
+            <span v-if="current.measurement?.frozen" class="gf-muted" style="font-size: 12px">
+              {{ current.measurement.recordNo || '—' }} · 量体师 {{ current.measurement.tailorName || '—' }}
+              · {{ day(current.measurement.measureDate) }}
+            </span>
+            <el-button
+              v-if="current.measurement?.pending"
+              size="small" type="warning" plain style="margin-left:auto"
+              @click="openConfirmMsr"
+            >
+              人工核对补录
+            </el-button>
+          </div>
+
+          <template v-if="current.measurement && !current.measurement.pending">
+            <div style="display:flex; flex-wrap:wrap; gap:6px 18px">
+              <span v-for="p in msrParts" :key="p.key">
+                <span class="gf-muted">{{ p.name }} </span>
+                <b>{{ num(current.measurement[p.key]) }} cm</b>
+              </span>
+            </div>
+            <div v-if="current.measurement.remark" class="gf-muted" style="font-size:12.5px;margin-top:8px">
+              量体备注：{{ current.measurement.remark }}
+            </div>
+            <div v-if="current.measurement.status === 'MANUAL_CONFIRMED'" class="gf-muted"
+                 style="font-size:12px;margin-top:6px">
+              由 {{ current.measurement.confirmedBy || '—' }} 人工核对确认，自动补齐不会覆盖该结果
+            </div>
+            <el-alert
+              v-if="current.measurement.status === 'LEGACY_LIVE'"
+              type="warning"
+              :closable="false"
+              show-icon
+              style="margin-top:8px"
+              title="历史订单尚未形成快照，当前为实时量体记录的兼容展示"
+              description="点击「补齐历史快照」或重新打开订单详情后即冻结；冻结前修改量体记录会改变这里的显示。"
+            />
+          </template>
+
+          <el-alert
+            v-else
+            type="warning"
+            :closable="false"
+            show-icon
+            title="原量体记录已缺失，尺寸待人工核对"
+            description="系统不会伪造尺寸；请联系量体师核对后点右侧「人工核对补录」。生产环节在补录前应暂停依据尺寸作业。"
+          />
         </div>
 
         <el-table :data="workOrders" border size="small">
@@ -171,6 +238,48 @@
         </template>
       </template>
     </el-drawer>
+
+    <!-- 缺失量体记录的旧订单：人工核对补录（冻结为 MANUAL_CONFIRMED，补齐永不覆盖） -->
+    <el-dialog v-model="confirmVisible" title="人工核对量体尺寸" width="560px">
+      <div v-if="current" class="gf-muted" style="font-size:12.5px;margin-bottom:10px">
+        {{ current.orderNo }} · {{ current.customerName }}：补录后将作为该订单的最终冻结尺寸，
+        重复执行历史补齐也不会覆盖。
+      </div>
+      <el-form label-width="86px">
+        <el-row :gutter="12">
+          <el-col :span="8">
+            <el-form-item label="量体单号"><el-input v-model="confirmForm.recordNo" placeholder="可留空" /></el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="量体师"><el-input v-model="confirmForm.tailorName" /></el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="量体日期">
+              <el-date-picker v-model="confirmForm.measureDate" type="date" value-format="YYYY-MM-DD"
+                              style="width:100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row :gutter="12">
+          <el-col :span="8" v-for="p in msrParts" :key="p.key">
+            <el-form-item :label="p.name">
+              <el-input-number v-model="confirmForm[p.key]" :min="40" :max="200" :step="0.5" :precision="1"
+                               controls-position="right" style="width:100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="备注">
+          <el-input v-model="confirmForm.remark" type="textarea" :rows="2" />
+        </el-form-item>
+        <el-form-item label="核对人">
+          <el-input v-model="confirmForm.operator" placeholder="谁核对谁签字" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="confirmVisible = false">取消</el-button>
+        <el-button type="primary" :loading="confirmSaving" @click="submitConfirmMsr">确认并冻结</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -194,6 +303,40 @@ const reworkRounds = ref([])
 const fittingSummary = ref({})
 const visible = ref(false)
 const current = ref(null)
+
+const msrParts = [
+  { key: 'bust', name: '胸围' },
+  { key: 'waist', name: '腰围' },
+  { key: 'hip', name: '臀围' },
+  { key: 'shoulder', name: '肩宽' },
+  { key: 'sleeveLength', name: '袖长' },
+  { key: 'bodyLength', name: '衣长' },
+  { key: 'pantsLength', name: '裤长' }
+]
+
+const confirmVisible = ref(false)
+const confirmSaving = ref(false)
+const confirmForm = reactive({
+  recordNo: '',
+  tailorName: '',
+  measureDate: '',
+  bust: 86,
+  waist: 68,
+  hip: 92,
+  shoulder: 38,
+  sleeveLength: 57,
+  bodyLength: 62,
+  pantsLength: 96,
+  remark: '',
+  operator: ''
+})
+
+function msTagType(ms) {
+  if (!ms) return 'info'
+  if (ms.pending) return 'danger'
+  if (ms.status === 'MANUAL_CONFIRMED') return 'success'
+  return ms.frozen ? 'primary' : 'warning'
+}
 
 const dueSoon = computed(
   () => allCards.value.filter((c) => {
@@ -248,6 +391,58 @@ async function load() {
     allCards.value = allCards.value.concat(cards)
   })
   meta.total = board.meta.total
+}
+
+async function backfill() {
+  try {
+    const result = await orderApi.backfillSnapshots()
+    ElMessage.success(
+      `补齐完成：新冻结 ${result.frozen || 0} 笔，待核对 ${result.markedMissing || 0} 笔`
+    )
+    await load()
+  } catch (e) {
+    /* 409/失败由调用提示 */
+    ElNotification.error({ message: e.message || '补齐失败', title: '历史快照补齐' })
+  }
+}
+
+function openConfirmMsr() {
+  Object.assign(confirmForm, {
+    recordNo: '',
+    tailorName: '',
+    measureDate: '',
+    bust: 86,
+    waist: 68,
+    hip: 92,
+    shoulder: 38,
+    sleeveLength: 57,
+    bodyLength: 62,
+    pantsLength: 96,
+    remark: '',
+    operator: ''
+  })
+  confirmVisible.value = true
+}
+
+async function submitConfirmMsr() {
+  if (!confirmForm.tailorName.trim()) return ElMessage.warning('请填写量体师')
+  if (!confirmForm.measureDate) return ElMessage.warning('请选择量体日期')
+  if (!confirmForm.operator.trim()) return ElMessage.warning('请填写核对人')
+  confirmSaving.value = true
+  try {
+    await orderApi.confirmMeasurement(current.value.id, { ...confirmForm })
+    ElMessage.success('量体尺寸已人工核对确认并冻结')
+    confirmVisible.value = false
+    await load()
+    const fresh = Object.values(
+      (await orderApi.board()).columns
+    ).flat().find((c) => c.id === current.value.id)
+    if (fresh) current.value = fresh
+  } catch (e) {
+    ElNotification.error({ message: e.message || '确认失败', title: '人工核对' })
+  } finally {
+    confirmSaving.value = false
+  }
 }
 
 async function open(card) {

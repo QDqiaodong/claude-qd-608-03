@@ -9,6 +9,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 
 /**
  * 量体记录：客户各部位净尺寸。
@@ -59,6 +60,22 @@ public class Measurement {
 
     @Column(name = "remark", length = 500)
     private String remark;
+
+    /**
+     * 乐观版本：下单向导选用历史量体后，若该记录在提交前被他人编辑/删除，
+     * 服务端按版本（或行锁后复查）识别竞争，明确要求重新选择，不写半份快照。
+     */
+    @Version
+    @Column(name = "version", nullable = false)
+    private Long version;
+
+    public Long getVersion() {
+        return version;
+    }
+
+    public void setVersion(Long version) {
+        this.version = version;
+    }
 
     public Long getId() {
         return id;

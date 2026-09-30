@@ -2,9 +2,11 @@ package com.garment.factory.dto;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.util.List;
 
 /**
- * 量体记录列表行：由 JPQL 构造器表达式直接投影。
+ * 量体记录列表行：由 JPQL 构造器表达式直接投影；
+ * 被订单引用情况（使用中的订单、是否可删）由服务层回填。
  */
 public class MeasurementListItemDto {
 
@@ -22,11 +24,17 @@ public class MeasurementListItemDto {
     private final BigDecimal bodyLength;
     private final BigDecimal pantsLength;
     private final String remark;
+    private final Long version;
+
+    /** 引用该记录的未交付订单（服务层回填）；为空表示编辑/删除不会影响在产订单 */
+    private List<MeasurementOrderRefDto> activeOrders = List.of();
+    /** 引用该记录的已交付订单数（服务层回填）：这些订单只看自己的快照 */
+    private long deliveredOrderCount = 0L;
 
     public MeasurementListItemDto(Long id, String recordNo, Long customerId, String customerName, String tailorName,
                                   LocalDate measureDate, BigDecimal bust, BigDecimal waist, BigDecimal hip,
                                   BigDecimal shoulder, BigDecimal sleeveLength, BigDecimal bodyLength,
-                                  BigDecimal pantsLength, String remark) {
+                                  BigDecimal pantsLength, String remark, Long version) {
         this.id = id;
         this.recordNo = recordNo;
         this.customerId = customerId;
@@ -41,6 +49,7 @@ public class MeasurementListItemDto {
         this.bodyLength = bodyLength;
         this.pantsLength = pantsLength;
         this.remark = remark;
+        this.version = version;
     }
 
     public Long getId() {
@@ -97,5 +106,25 @@ public class MeasurementListItemDto {
 
     public String getRemark() {
         return remark;
+    }
+
+    public Long getVersion() {
+        return version;
+    }
+
+    public List<MeasurementOrderRefDto> getActiveOrders() {
+        return activeOrders;
+    }
+
+    public void setActiveOrders(List<MeasurementOrderRefDto> activeOrders) {
+        this.activeOrders = activeOrders == null ? List.of() : activeOrders;
+    }
+
+    public long getDeliveredOrderCount() {
+        return deliveredOrderCount;
+    }
+
+    public void setDeliveredOrderCount(long deliveredOrderCount) {
+        this.deliveredOrderCount = deliveredOrderCount;
     }
 }

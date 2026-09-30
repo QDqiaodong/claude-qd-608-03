@@ -47,13 +47,12 @@ public interface CustomOrderRepository extends JpaRepository<CustomOrder, Long> 
                                     Pageable pageable);
 
     @Query("SELECT new com.garment.factory.dto.OrderBoardCardDto("
-            + "o.id, o.orderNo, c.name, s.name, f.name, f.colorHex, m.tailorName, o.deliveryDate, "
+            + "o.id, o.orderNo, c.name, s.name, f.name, f.colorHex, o.measurementId, o.deliveryDate, "
             + "o.totalPrice, o.usageMeters, o.status, o.balancePaid) "
             + "FROM CustomOrder o "
             + "JOIN com.garment.factory.domain.Customer c ON c.id = o.customerId "
             + "JOIN com.garment.factory.domain.Style s ON s.id = o.styleId "
             + "JOIN com.garment.factory.domain.Fabric f ON f.id = o.fabricId "
-            + "LEFT JOIN com.garment.factory.domain.Measurement m ON m.id = o.measurementId "
             + "ORDER BY o.deliveryDate ASC, o.id DESC")
     List<OrderBoardCardDto> findBoardCards();
 

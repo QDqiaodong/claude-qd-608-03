@@ -16,13 +16,16 @@ import com.garment.factory.common.ApiResponse;
 import com.garment.factory.domain.CustomOrder;
 import com.garment.factory.domain.GarmentDict;
 import com.garment.factory.dto.CustomerOptionDto;
+import com.garment.factory.dto.MeasurementConfirmReq;
 import com.garment.factory.dto.OrderAdvanceReq;
 import com.garment.factory.dto.OrderCreateReq;
+import com.garment.factory.dto.OrderDetailDto;
 import com.garment.factory.dto.OrderListItemDto;
 import com.garment.factory.dto.PricePreviewDto;
 import com.garment.factory.dto.PricePreviewReq;
 import com.garment.factory.dto.SliceView;
 import com.garment.factory.service.OrderService;
+import com.garment.factory.service.OrderSnapshotService;
 
 /**
  * 定制订单：向导式下单、订单列表、进度看板、状态流转、尾款结算。
@@ -32,9 +35,11 @@ import com.garment.factory.service.OrderService;
 public class OrderController {
 
     private final OrderService orderService;
+    private final OrderSnapshotService snapshotService;
 
-    public OrderController(OrderService orderService) {
+    public OrderController(OrderService orderService, OrderSnapshotService snapshotService) {
         this.orderService = orderService;
+        this.snapshotService = snapshotService;
     }
 
     /** 列表：JPQL 构造器表达式投影 + Slice 滚动分页 */
@@ -61,8 +66,38 @@ public class OrderController {
     }
 
     @GetMapping("/{id}")
-    public ApiResponse<CustomOrder> detail(@PathVariable Long id) {
+    public ApiResponse<OrderDetailDto> detail(@PathVariable Long id) {
         return ApiResponse.success(orderService.detail(id));
+    }
+
+    /**
+     * 历史订单量体快照补齐（可重复执行，幂等）：
+     * 原记录在的订单冻结原尺寸，原记录缺失的订单标待核对；重复执行只形成一份快照。
+     */
+    @PostMapping("/measurement-snapshots/backfill")
+    public ApiResponse<Map<String, Object>> backfillSnapshots() {
+        Map<String, Object> result = snapshotService.backfillAll();
+        int frozen = ((Number) result.getOrDefault("frozen", 0)).intValue();
+        int missing = ((Number) result.getOrDefault("markedMissing", 0)).intValue();
+        int scanned = ((Number) result.getOrDefault("scanned", 0)).intValue();
+        String message;
+        if (scanned == 0) {
+            message = "所有订单均已有量体快照，无需重复补齐";
+        } else {
+            message = "已补齐 " + frozen + " 笔订单的量体快照";
+            if (missing > 0) {
+                message += "；" + missing + " 笔原量体记录已缺失，已标记待核对";
+            }
+        }
+        return ApiResponse.success(message, result);
+    }
+
+    /** 原量体记录缺失的订单，人工核对尺寸后补录确认（自动补齐永不覆盖该结果） */
+    @PostMapping("/{id}/measurement-confirm")
+    public ApiResponse<CustomOrder> confirmMeasurement(@PathVariable Long id,
+                                                       @RequestBody MeasurementConfirmReq req) {
+        snapshotService.confirmMissing(id, req);
+        return ApiResponse.success("量体尺寸已人工核对确认并冻结", orderService.detail(id).getOrder());
     }
 
     /** 下单向导第 4 步：实时算价 */

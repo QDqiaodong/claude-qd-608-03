@@ -29,6 +29,7 @@ DROP TABLE IF EXISTS fitting_action_log;
 DROP TABLE IF EXISTS fitting_rework_round;
 DROP TABLE IF EXISTS fitting_issue;
 DROP TABLE IF EXISTS work_order;
+DROP TABLE IF EXISTS order_measurement_snapshot;
 DROP TABLE IF EXISTS custom_order;
 DROP TABLE IF EXISTS measurement;
 DROP TABLE IF EXISTS fabric;
@@ -86,6 +87,7 @@ CREATE TABLE measurement (
     body_len     DECIMAL(6,2)  NOT NULL COMMENT '衣长 cm',
     pants_len    DECIMAL(6,2)  NOT NULL COMMENT '裤长 cm',
     remark       VARCHAR(500)  COMMENT '备注',
+    version      BIGINT        NOT NULL DEFAULT 0 COMMENT '乐观版本：下单期间记录被改动则要求重新选择',
     PRIMARY KEY (id),
     UNIQUE KEY uk_record_no (record_no),
     KEY idx_msr_customer (customer_id)
@@ -134,6 +136,39 @@ CREATE TABLE custom_order (
     UNIQUE KEY uk_order_no (order_no),
     KEY idx_order_status (status)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '定制订单';
+
+-- ---------------------------------------------------------------------------
+-- 模块四：订单量体快照（订单确认时冻结的完整量体事实，与订单 1:1）
+-- 看板 / 订单详情 / 工序侧一律读本表，量体记录后续编辑删除不影响历史订单。
+-- FROZEN：下单冻结（或旧数据按原记录补齐）；MISSING：原记录缺失待人工核对（尺寸列留空，不伪造）；
+-- MANUAL_CONFIRMED：人工核对补录确认，自动补齐永不覆盖。
+-- ---------------------------------------------------------------------------
+CREATE TABLE order_measurement_snapshot (
+    id             BIGINT        NOT NULL AUTO_INCREMENT,
+    order_id       BIGINT        NOT NULL COMMENT '所属订单（1:1）',
+    measurement_id BIGINT        COMMENT '来源量体记录（记录事后删除仍保留指向）',
+    record_no      VARCHAR(30)   COMMENT '量体单号',
+    customer_id    BIGINT        COMMENT '客户',
+    customer_name  VARCHAR(50)   COMMENT '客户姓名（冻结冗余）',
+    tailor_name    VARCHAR(50)   COMMENT '量体师（冻结）',
+    measure_date   DATE          COMMENT '量体日期（冻结）',
+    bust           DECIMAL(6,2)  COMMENT '胸围 cm（MISSING 待核对时留空）',
+    waist          DECIMAL(6,2)  COMMENT '腰围 cm',
+    hip            DECIMAL(6,2)  COMMENT '臀围 cm',
+    shoulder       DECIMAL(6,2)  COMMENT '肩宽 cm',
+    sleeve_len     DECIMAL(6,2)  COMMENT '袖长 cm',
+    body_len       DECIMAL(6,2)  COMMENT '衣长 cm',
+    pants_len      DECIMAL(6,2)  COMMENT '裤长 cm',
+    remark         VARCHAR(500)  COMMENT '量体备注（冻结）',
+    status         VARCHAR(20)   NOT NULL COMMENT 'FROZEN/MISSING/MANUAL_CONFIRMED',
+    frozen_at      DATETIME      NOT NULL COMMENT '冻结/确认时间',
+    confirmed_by   VARCHAR(50)   COMMENT '人工核对操作人',
+    created_at     DATETIME      NOT NULL,
+    updated_at     DATETIME      NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_oms_order (order_id),
+    KEY idx_oms_measurement (measurement_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '订单量体快照';
 
 -- ---------------------------------------------------------------------------
 -- 模块五：工序工单
@@ -411,7 +446,9 @@ INSERT INTO measurement (id, record_no, customer_id, customer_name, tailor_name,
   (9, 'ME-4009', 9, '傅清让', '莫岑', '2026-09-04', 98.00, 85.00, 100.00, 45.00, 62.00, 72.00, 104.00, '男士西服套装'),
   (10, 'ME-4010', 10, '江宴如', '方绮', '2026-09-06', 85.00, 67.00, 91.00, 37.50, 56.00, 61.00, 93.00, '偏好宽松版型'),
   (11, 'ME-4011', 11, '宋亦舒', '罗予', '2026-09-08', 89.00, 73.00, 96.00, 39.00, 57.00, 64.00, 98.00, '二次复尺，数据稳定'),
-  (12, 'ME-4012', 12, '陆时宜', '莫岑', '2026-09-10', 83.00, 65.00, 89.00, 36.00, 55.00, 59.00, 91.00, '礼服专用净体尺寸');
+  (12, 'ME-4012', 12, '陆时宜', '莫岑', '2026-09-10', 83.00, 65.00, 89.00, 36.00, 55.00, 59.00, 91.00, '礼服专用净体尺寸'),
+  (13, 'ME-4013', 11, '宋亦舒', '罗予', '2026-09-12', 89.50, 73.50, 96.50, 39.00, 57.00, 64.00, 98.00, '最新复尺，供新订单使用，不影响已交付订单'),
+  (14, 'ME-4014', 5, '苏未晚', '方绮', '2026-09-15', 93.00, 77.00, 100.00, 40.50, 59.50, 66.50, 101.50, '婚礼后的保养期复尺');
 
 -- ---------- 面料库存 ----------
 INSERT INTO fabric (id, fabric_no, name, composition, color, color_hex, stock_meters, unit_price, supplier) VALUES
@@ -444,6 +481,32 @@ INSERT INTO custom_order (id, order_no, customer_id, style_id, fabric_id, measur
   (12, 'ORD-20260012', 12, 3, 6, 12, 4.00, '2026-08-25', '2026-09-28', 1640.00, 5680.00, 7320.00, 3660.00, 3660.00, 1, 0, 'FINISHED', '整体完成待出仓，尾款未结'),
   (13, 'ORD-20260013', 1, 2, 9, 1, 3.60, '2026-08-19', '2026-09-25', 1396.80, 3280.00, 4676.80, 2338.40, 2338.40, 1, 1, 'DELIVERED', '已交付，客户很满意'),
   (14, 'ORD-20260014', 5, 7, 3, 5, 5.60, '2026-08-13', '2026-09-19', 1792.00, 8800.00, 10592.00, 5296.00, 5296.00, 1, 1, 'DELIVERED', '婚礼已办完');
+
+-- 订单 14 演示「原量体记录已删除、但已交付订单仍完整展示原尺寸」：记录指向不存在的 999，快照保留原值
+UPDATE custom_order SET measurement_id = 999 WHERE id = 14;
+
+-- ---------- 订单量体快照 ----------
+-- 在产/未交付订单 1~12 中除订单 3 外均已下单冻结，之后量体记录怎么改都不影响看板与生产；
+-- 订单 3 故意不落快照，演示旧订单兼容读取（看板先按实时记录展示「历史兼容」）与幂等补齐；
+-- 订单 13（已交付）：原量体记录已丢失，待人工核对（尺寸列留空，不伪造）；
+-- 订单 14（已交付）：来源记录（id=999）已物理删除，快照仍完整保留原尺寸。
+INSERT INTO order_measurement_snapshot
+  (id, order_id, measurement_id, record_no, customer_id, customer_name, tailor_name, measure_date,
+   bust, waist, hip, shoulder, sleeve_len, body_len, pants_len, remark, status, frozen_at, confirmed_by,
+   created_at, updated_at) VALUES
+  (1, 1, 1, 'ME-4001', 1, '沈曼青', '方绮', '2026-08-22', 86.00, 68.00, 92.00, 38.00, 57.00, 62.00, 96.00, '常穿高跟鞋，裤长加 2cm', 'FROZEN', '2026-09-20 10:00:00', NULL, '2026-09-20 10:00:00', '2026-09-20 10:00:00'),
+  (2, 2, 2, 'ME-4002', 2, '顾知微', '方绮', '2026-08-23', 90.00, 74.00, 97.00, 39.50, 58.00, 65.00, 99.00, '肩部略偏，需调版', 'FROZEN', '2026-09-19 10:00:00', NULL, '2026-09-19 10:00:00', '2026-09-19 10:00:00'),
+  (4, 4, 4, 'ME-4004', 4, '裴盈盈', '罗予', '2026-08-25', 88.00, 70.00, 95.00, 38.50, 56.50, 63.00, 97.00, '第一次定制，留放余量', 'FROZEN', '2026-09-15 10:00:00', NULL, '2026-09-15 10:00:00', '2026-09-15 10:00:00'),
+  (5, 5, 5, 'ME-4005', 5, '苏未晚', '方绮', '2026-08-27', 92.00, 76.00, 99.00, 40.00, 59.00, 66.00, 101.00, '孕期后复尺', 'FROZEN', '2026-09-10 10:00:00', NULL, '2026-09-10 10:00:00', '2026-09-10 10:00:00'),
+  (6, 6, 6, 'ME-4006', 6, '周静姝', '罗予', '2026-08-29', 84.00, 66.00, 90.00, 37.00, 55.50, 60.00, 94.00, '袖长偏短 1cm', 'FROZEN', '2026-09-09 10:00:00', NULL, '2026-09-09 10:00:00', '2026-09-09 10:00:00'),
+  (7, 7, 7, 'ME-4007', 7, '何以柔', '莫岑', '2026-08-31', 87.00, 71.00, 94.00, 38.00, 57.50, 61.00, 95.00, '要求加薄垫肩', 'FROZEN', '2026-09-06 10:00:00', NULL, '2026-09-06 10:00:00', '2026-09-06 10:00:00'),
+  (8, 8, 8, 'ME-4008', 8, '白锦瑟', '莫岑', '2026-09-02', 80.00, 42.00, 86.00, 35.50, 54.00, 56.00, 90.00, '腰围超小，需单独开版', 'FROZEN', '2026-09-04 10:00:00', NULL, '2026-09-04 10:00:00', '2026-09-04 10:00:00'),
+  (9, 9, 9, 'ME-4009', 9, '傅清让', '莫岑', '2026-09-04', 98.00, 85.00, 100.00, 45.00, 62.00, 72.00, 104.00, '男士西服套装', 'FROZEN', '2026-09-08 10:00:00', NULL, '2026-09-08 10:00:00', '2026-09-08 10:00:00'),
+  (10, 10, 10, 'ME-4010', 10, '江宴如', '方绮', '2026-09-06', 85.00, 67.00, 91.00, 37.50, 56.00, 61.00, 93.00, '偏好宽松版型', 'FROZEN', '2026-09-01 10:00:00', NULL, '2026-09-01 10:00:00', '2026-09-01 10:00:00'),
+  (11, 11, 11, 'ME-4011', 11, '宋亦舒', '罗予', '2026-09-08', 89.00, 73.00, 96.00, 39.00, 57.00, 64.00, 98.00, '二次复尺，数据稳定', 'FROZEN', '2026-08-29 10:00:00', NULL, '2026-08-29 10:00:00', '2026-08-29 10:00:00'),
+  (12, 12, 12, 'ME-4012', 12, '陆时宜', '莫岑', '2026-09-10', 83.00, 65.00, 89.00, 36.00, 55.00, 59.00, 91.00, '礼服专用净体尺寸', 'FROZEN', '2026-08-25 10:00:00', NULL, '2026-08-25 10:00:00', '2026-08-25 10:00:00'),
+  (13, 13, 1, 'ME-4001', 1, '沈曼青', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '原量体记录已缺失，尺寸待人工核对', 'MISSING', '2026-08-19 10:00:00', NULL, '2026-08-19 10:00:00', '2026-08-19 10:00:00'),
+  (14, 14, 999, NULL, 5, '苏未晚', '方绮', '2026-08-10', 92.00, 76.00, 99.00, 40.00, 59.00, 66.00, 101.00, '婚礼定制，原量体单已归档删除', 'FROZEN', '2026-08-13 10:00:00', NULL, '2026-08-13 10:00:00', '2026-08-13 10:00:00');
 
 -- ---------- 工序工单 ----------
 INSERT INTO work_order (id, wo_no, order_id, step, owner, planned_hours, actual_hours, status, remark) VALUES

@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.garment.factory.common.BizException;
+import com.garment.factory.common.ConflictException;
 import com.garment.factory.domain.Customer;
 import com.garment.factory.domain.CustomOrder;
 import com.garment.factory.domain.Fabric;
@@ -25,7 +26,9 @@ import com.garment.factory.dto.MeasurementSaveReq;
 import com.garment.factory.dto.OrderAdvanceReq;
 import com.garment.factory.dto.OrderBoardCardDto;
 import com.garment.factory.dto.OrderCreateReq;
+import com.garment.factory.dto.OrderDetailDto;
 import com.garment.factory.dto.OrderListItemDto;
+import com.garment.factory.dto.OrderMeasurementView;
 import com.garment.factory.dto.PricePreviewDto;
 import com.garment.factory.dto.PricePreviewReq;
 import com.garment.factory.dto.SliceView;
@@ -52,12 +55,13 @@ public class OrderService {
     private final MeasurementService measurementService;
     private final WorkOrderService workOrderService;
     private final FittingIssueService fittingIssueService;
+    private final OrderSnapshotService snapshotService;
 
     public OrderService(CustomOrderRepository orderRepository, CustomerRepository customerRepository,
                         StyleRepository styleRepository, FabricRepository fabricRepository,
                         MeasurementRepository measurementRepository, WorkOrderRepository workOrderRepository,
                         MeasurementService measurementService, WorkOrderService workOrderService,
-                        FittingIssueService fittingIssueService) {
+                        FittingIssueService fittingIssueService, OrderSnapshotService snapshotService) {
         this.orderRepository = orderRepository;
         this.customerRepository = customerRepository;
         this.styleRepository = styleRepository;
@@ -67,6 +71,7 @@ public class OrderService {
         this.measurementService = measurementService;
         this.workOrderService = workOrderService;
         this.fittingIssueService = fittingIssueService;
+        this.snapshotService = snapshotService;
     }
 
     // ---------------- 列表 / 看板 ----------------
@@ -87,6 +92,16 @@ public class OrderService {
             long done = workOrderRepository.countByOrderIdAndStatus(card.getId(), "DONE");
             progress.put(card.getId(), new long[]{total, done});
         }
+        // 量体口径统一走快照服务：有快照读冻结值，旧订单无快照才回退实时记录（标注历史兼容）
+        List<Long> orderIds = cards.stream().map(OrderBoardCardDto::getId).toList();
+        Map<Long, Long> measurementIdByOrder = new LinkedHashMap<>();
+        Map<Long, String> customerNameByOrder = new LinkedHashMap<>();
+        for (OrderBoardCardDto card : cards) {
+            measurementIdByOrder.put(card.getId(), card.getMeasurementId());
+            customerNameByOrder.put(card.getId(), card.getCustomerName());
+        }
+        Map<Long, OrderMeasurementView> measurements =
+                snapshotService.viewsForOrders(orderIds, measurementIdByOrder, customerNameByOrder);
         Map<String, List<OrderBoardCardDto>> columns = new LinkedHashMap<>();
         for (String status : GarmentDict.orderStatusOrder()) {
             columns.put(status, new ArrayList<>());
@@ -95,6 +110,7 @@ public class OrderService {
             long[] pair = progress.getOrDefault(card.getId(), new long[]{0L, 0L});
             card.setWorkOrderTotal(pair[0]);
             card.setWorkOrderDone(pair[1]);
+            card.setMeasurement(measurements.get(card.getId()));
             columns.computeIfAbsent(card.getStatus(), key -> new ArrayList<>()).add(card);
         }
         // 整改台口径：未关闭问题数 / 阻断数 / 返修工单数 / 当前阶段，看板与整改台共用同一汇总
@@ -110,9 +126,15 @@ public class OrderService {
         return result;
     }
 
-    @Transactional(readOnly = true)
-    public CustomOrder detail(Long id) {
-        return orderRepository.findById(id).orElseThrow(() -> new BizException("订单不存在"));
+    /**
+     * 订单详情：旧订单在此惰性、幂等地补齐快照（原记录缺失则标待核对），
+     * 看板/详情/工序侧因此始终使用同一份冻结结果，刷新或重开不会退回实时记录。
+     */
+    @Transactional
+    public OrderDetailDto detail(Long id) {
+        CustomOrder order = orderRepository.findById(id).orElseThrow(() -> new BizException("订单不存在"));
+        OrderMeasurementView measurement = snapshotService.viewForOrderDetail(order);
+        return new OrderDetailDto(order, measurement);
     }
 
     @Transactional(readOnly = true)
@@ -190,10 +212,18 @@ public class OrderService {
         // 第 2 步：可用已有量体记录，也可现场新录一条
         Measurement measurement = null;
         if (req.getMeasurementId() != null) {
-            measurement = measurementRepository.findById(req.getMeasurementId())
-                    .orElseThrow(() -> new BizException("量体记录不存在"));
+            // 持量体记录行锁读取：与量体记录的编辑/删除串行，订单与快照在同一事务落库，
+            // 不会出现「订单已创建、快照写一半」或记录已删的悬空引用。
+            measurement = measurementRepository.findByIdForUpdate(req.getMeasurementId())
+                    .orElseThrow(() -> new ConflictException("所选量体记录已被删除，请重新选择量体记录后下单"));
             if (!measurement.getCustomerId().equals(customer.getId())) {
                 throw new BizException("量体记录不属于该客户，请重新选择");
+            }
+            // 版本校验：向导打开后该记录被他人改过，则明确要求重新选择，不静默采用新版本
+            if (req.getExpectedMeasurementVersion() != null
+                    && !req.getExpectedMeasurementVersion().equals(measurement.getVersion())) {
+                throw new ConflictException("量体记录「" + measurement.getRecordNo()
+                        + "」在你下单期间已被他人修改，请重新核对并选择当前版本");
             }
         } else if (req.getMeasurement() != null) {
             MeasurementSaveReq msr = req.getMeasurement();
@@ -229,6 +259,9 @@ public class OrderService {
         order.setStatus("ORDERED");
         order.setRemark(req.getRemark());
         CustomOrder saved = orderRepository.save(order);
+
+        // 冻结当次确认的完整量体事实：与订单同一事务落库，之后量体记录的编辑/删除不再影响本单
+        snapshotService.freezeForNewOrder(saved, measurement, customer.getName());
 
         // 扣减面料库存 + 按标准工序自动生成待开工工单
         fabricRepository.restock(fabric.getId(), usage.negate());
@@ -359,6 +392,8 @@ public class OrderService {
         if (!workOrders.isEmpty()) {
             workOrderRepository.deleteAll(workOrders);
         }
+        // 撤销订单时一并删除其快照（快照是订单的从属事实，订单不存在即无意义）
+        snapshotService.deleteForOrder(id);
         orderRepository.delete(order);
     }
 
