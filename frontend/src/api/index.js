@@ -44,6 +44,7 @@ export const measurementApi = {
   list: (params) => request.get('/measurements', { params }),
   byCustomer: (customerId) => request.get(`/measurements/by-customer/${customerId}`),
   tailors: () => request.get('/measurements/tailors'),
+  usage: (id) => request.get(`/measurements/${id}/usage`),
   save: (data) => request.post('/measurements', data),
   remove: (id) => request.delete(`/measurements/${id}`)
 }
@@ -64,7 +65,9 @@ export const orderApi = {
   create: (data) => request.post('/orders', data),
   advance: (id, payload) => request.post(`/orders/${id}/advance`, payload || {}),
   payBalance: (id) => request.post(`/orders/${id}/balance-pay`),
-  remove: (id) => request.delete(`/orders/${id}`)
+  remove: (id) => request.delete(`/orders/${id}`),
+  backfillSnapshots: () => request.post('/orders/snapshots/backfill'),
+  confirmSnapshot: (id, data) => request.post(`/orders/${id}/snapshot/confirm`, data)
 }
 
 export const workOrderApi = {

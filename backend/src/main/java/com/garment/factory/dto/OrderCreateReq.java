@@ -12,6 +12,8 @@ public class OrderCreateReq {
     private Long styleId;
     private Long fabricId;
     private Long measurementId;
+    /** 选中历史量体时列表回传的版本号；与现库不一致说明期间被编辑，服务端 409 要求重新选择 */
+    private Integer measurementVersion;
     private BigDecimal usageMeters;
     private LocalDate deliveryDate;
     private Boolean payDeposit;
@@ -50,6 +52,14 @@ public class OrderCreateReq {
 
     public void setMeasurementId(Long measurementId) {
         this.measurementId = measurementId;
+    }
+
+    public Integer getMeasurementVersion() {
+        return measurementVersion;
+    }
+
+    public void setMeasurementVersion(Integer measurementVersion) {
+        this.measurementVersion = measurementVersion;
     }
 
     public BigDecimal getUsageMeters() {

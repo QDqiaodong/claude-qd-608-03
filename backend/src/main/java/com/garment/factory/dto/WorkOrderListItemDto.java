@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 
 /**
  * 工单列表项：工单页表格 / 看板抽屉用（JPQL 构造器表达式投影）。
+ * 量体口径来自订单冻结快照（snap.*），与订单看板/订单详情完全一致。
  */
 public class WorkOrderListItemDto {
 
@@ -20,9 +21,16 @@ public class WorkOrderListItemDto {
     private final String status;
     private final String remark;
 
+    /** 订单冻结量体摘要：量体单号/量体师 + 待核对标记（工序侧按同一快照口径展示） */
+    private final String recordNo;
+    private final String tailorName;
+    private final String snapshotStatus;
+    private final boolean measurementPendingVerify;
+
     public WorkOrderListItemDto(Long id, String woNo, Long orderId, String orderNo, String customerName,
                                 String styleName, String step, String owner, BigDecimal plannedHours,
-                                BigDecimal actualHours, String status, String remark) {
+                                BigDecimal actualHours, String status, String remark,
+                                String recordNo, String tailorName, String snapshotStatus) {
         this.id = id;
         this.woNo = woNo;
         this.orderId = orderId;
@@ -35,6 +43,11 @@ public class WorkOrderListItemDto {
         this.actualHours = actualHours;
         this.status = status;
         this.remark = remark;
+        this.recordNo = recordNo;
+        this.tailorName = tailorName;
+        this.snapshotStatus = snapshotStatus;
+        this.measurementPendingVerify =
+                com.garment.factory.domain.OrderMeasurementSnapshot.STATUS_PENDING_VERIFY.equals(snapshotStatus);
     }
 
     public Long getId() {
@@ -83,5 +96,21 @@ public class WorkOrderListItemDto {
 
     public String getRemark() {
         return remark;
+    }
+
+    public String getRecordNo() {
+        return recordNo;
+    }
+
+    public String getTailorName() {
+        return tailorName;
+    }
+
+    public String getSnapshotStatus() {
+        return snapshotStatus;
+    }
+
+    public boolean isMeasurementPendingVerify() {
+        return measurementPendingVerify;
     }
 }

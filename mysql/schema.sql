@@ -29,6 +29,7 @@ DROP TABLE IF EXISTS fitting_action_log;
 DROP TABLE IF EXISTS fitting_rework_round;
 DROP TABLE IF EXISTS fitting_issue;
 DROP TABLE IF EXISTS work_order;
+DROP TABLE IF EXISTS order_measurement_snapshot;
 DROP TABLE IF EXISTS custom_order;
 DROP TABLE IF EXISTS measurement;
 DROP TABLE IF EXISTS fabric;
@@ -37,32 +38,6 @@ DROP TABLE IF EXISTS customer;
 DROP TABLE IF EXISTS grade_scheme;
 
 SET FOREIGN_KEY_CHECKS = 1;
-
--- ---------------------------------------------------------------------------
--- 模块七：版型批量放码
--- compose MySQL 实际从本文件初始化；与后端 schema.sql 保持同一表结构。
--- ---------------------------------------------------------------------------
-CREATE TABLE grade_scheme (
-    id             BIGINT       NOT NULL AUTO_INCREMENT,
-    scheme_no      VARCHAR(30)  NOT NULL COMMENT '放码方案号',
-    name           VARCHAR(80)  NOT NULL COMMENT '方案名称',
-    style_id       BIGINT       COMMENT '关联款式（空=临时计算方案）',
-    status         VARCHAR(10)  NOT NULL DEFAULT 'SAVED' COMMENT 'SAVED/临时方案不落库',
-    base_size_code VARCHAR(20)  NOT NULL COMMENT '基准尺码',
-    input_unit     VARCHAR(4)   NOT NULL DEFAULT 'CM' COMMENT '录入单位 CM/MM（仅影响录入回显）',
-    round_step_mm  DECIMAL(8,2) NOT NULL DEFAULT 1.00 COMMENT '统一舍入步进（毫米）',
-    sizes_json     MEDIUMTEXT   NOT NULL COMMENT '有序尺码序列 JSON',
-    bases_json     MEDIUMTEXT   NOT NULL COMMENT '基准尺寸 JSON（毫米）',
-    rules_json     MEDIUMTEXT   NOT NULL COMMENT '分部位放码规则 JSON（毫米规范参数）',
-    snapshot_json  MEDIUMTEXT   NOT NULL COMMENT '完整结果快照 JSON（毫米+厘米+异常定位）',
-    legacy_flag    TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '旧厘米数据兼容标记',
-    result_version INT          NOT NULL DEFAULT 1 COMMENT '结果版本，每次重新生成+1',
-    created_at     DATETIME     NOT NULL,
-    updated_at     DATETIME     NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_grade_scheme_no (scheme_no),
-    KEY idx_grade_style (style_id)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '版型批量放码方案';
 
 -- ---------------------------------------------------------------------------
 -- 客户（订单与量体的归属对象）
@@ -112,6 +87,7 @@ CREATE TABLE measurement (
     body_len     DECIMAL(6,2)  NOT NULL COMMENT '衣长 cm',
     pants_len    DECIMAL(6,2)  NOT NULL COMMENT '裤长 cm',
     remark       VARCHAR(500)  COMMENT '备注',
+    version      INT           NOT NULL DEFAULT 0 COMMENT '乐观版本：并发编辑/下单竞争检测',
     PRIMARY KEY (id),
     UNIQUE KEY uk_record_no (record_no),
     KEY idx_msr_customer (customer_id)
@@ -160,6 +136,44 @@ CREATE TABLE custom_order (
     UNIQUE KEY uk_order_no (order_no),
     KEY idx_order_status (status)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '定制订单';
+
+-- ---------------------------------------------------------------------------
+-- 模块四附：订单量体快照
+-- 订单确认（建立）时把当次采用的量体记录完整冻结：尺寸/量体师/量体日期/备注一单一份。
+-- 冻结后与 measurement 解耦——后续编辑/删除量体记录不改写本快照；
+-- 看板、订单详情、工序侧一律读本表。
+-- status：FROZEN(下单冻结/旧数据自动补齐) / PENDING_VERIFY(旧记录缺失，待人工核对，尺寸为空)
+--         / MANUAL_CONFIRMED(人工核对确认，自动补齐永不覆盖)
+-- source：FROZEN(下单时) / BACKFILL(旧订单补齐)
+-- ---------------------------------------------------------------------------
+CREATE TABLE order_measurement_snapshot (
+    id             BIGINT        NOT NULL AUTO_INCREMENT,
+    order_id       BIGINT        NOT NULL COMMENT '所属订单（一单一份）',
+    measurement_id BIGINT        COMMENT '来源量体记录（旧记录缺失的待核对快照为空）',
+    record_no      VARCHAR(30)   COMMENT '冻结时量体单号（来源删除后仍可追溯）',
+    customer_name  VARCHAR(50)   COMMENT '客户姓名',
+    tailor_name    VARCHAR(50)   COMMENT '量体师',
+    measure_date   DATE          COMMENT '量体日期',
+    bust           DECIMAL(6,2) COMMENT '胸围 cm（待核对为空，严禁伪造）',
+    waist          DECIMAL(6,2) COMMENT '腰围 cm',
+    hip            DECIMAL(6,2) COMMENT '臀围 cm',
+    shoulder       DECIMAL(6,2) COMMENT '肩宽 cm',
+    sleeve_len     DECIMAL(6,2) COMMENT '袖长 cm',
+    body_len       DECIMAL(6,2) COMMENT '衣长 cm',
+    pants_len      DECIMAL(6,2) COMMENT '裤长 cm',
+    measure_remark VARCHAR(500)  COMMENT '量体备注',
+    status         VARCHAR(20)   NOT NULL DEFAULT 'FROZEN' COMMENT 'FROZEN/PENDING_VERIFY/MANUAL_CONFIRMED',
+    source         VARCHAR(20)   NOT NULL DEFAULT 'FROZEN' COMMENT 'FROZEN/BACKFILL',
+    frozen_at      DATETIME      NOT NULL COMMENT '冻结时间',
+    backfilled_at  DATETIME      COMMENT '补齐时间（旧订单）',
+    verify_note    VARCHAR(500)  COMMENT '待核对/核对说明',
+    confirmed_by   VARCHAR(50)   COMMENT '人工核对操作人',
+    confirmed_at   DATETIME      COMMENT '人工核对时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_order_snapshot (order_id),
+    KEY idx_oms_measurement (measurement_id),
+    KEY idx_oms_status (status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '订单量体快照';
 
 -- ---------------------------------------------------------------------------
 -- 模块五：工序工单
@@ -262,11 +276,41 @@ CREATE TABLE fitting_action_log (
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '试衣整改操作流水';
 
 -- ---------------------------------------------------------------------------
+-- 模块七：版型批量放码
+-- 内部一律以【毫米】为规范单位（BigDecimal 序列化为字符串），round_step_mm 是统一舍入步进；
+-- sizes/bases/rules 为规范化规则，snapshot 为服务端一次算完的完整不可变结果。
+-- legacy_flag=1 是旧厘米数据兼容行（round_step_mm=0.1，重算仍为旧的两位小数厘米值）。
+-- ---------------------------------------------------------------------------
+CREATE TABLE grade_scheme (
+    id             BIGINT       NOT NULL AUTO_INCREMENT,
+    scheme_no      VARCHAR(30)  NOT NULL COMMENT '放码方案号',
+    name           VARCHAR(80)  NOT NULL COMMENT '方案名称',
+    style_id       BIGINT       COMMENT '关联款式（空=临时计算方案）',
+    status         VARCHAR(10)  NOT NULL DEFAULT 'SAVED' COMMENT 'SAVED/临时方案不落库',
+    base_size_code VARCHAR(20)  NOT NULL COMMENT '基准尺码',
+    input_unit     VARCHAR(4)   NOT NULL DEFAULT 'CM' COMMENT '录入单位 CM/MM（仅影响录入回显）',
+    round_step_mm  DECIMAL(8,2) NOT NULL DEFAULT 1.00 COMMENT '统一舍入步进（毫米）',
+    sizes_json     MEDIUMTEXT   NOT NULL COMMENT '有序尺码序列 JSON',
+    bases_json     MEDIUMTEXT   NOT NULL COMMENT '基准尺寸 JSON（毫米）',
+    rules_json     MEDIUMTEXT   NOT NULL COMMENT '分部位放码规则 JSON（毫米规范参数）',
+    snapshot_json  MEDIUMTEXT   NOT NULL COMMENT '完整结果快照 JSON（毫米+厘米+异常定位）',
+    legacy_flag    TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '旧厘米数据兼容标记',
+    result_version INT          NOT NULL DEFAULT 1 COMMENT '结果版本，每次重新生成+1',
+    created_at     DATETIME     NOT NULL,
+    updated_at     DATETIME     NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_grade_scheme_no (scheme_no),
+    KEY idx_grade_style (style_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '版型批量放码方案';
+
+-- ---------------------------------------------------------------------------
 -- 模块八：裁片套件封包交接
 -- 状态机：DRAFT(草稿) → SEALED(已封包) → HANDED_OVER(已交接) → RECEIVED(已接收)
 -- 交接后发现漏片/混片进入 EXCEPTION(异常)，补齐复核通过后回到 HANDED_OVER 再接收；
 -- 已交接的套件不能回到草稿；已封包清单冻结，拆包必须填原因并在事件表留前后快照。
 -- ---------------------------------------------------------------------------
+
+-- 裁片套件主表（一件定制服装一个裁剪批次的全部裁片归一个套件）
 CREATE TABLE cut_kit (
     id              BIGINT       NOT NULL AUTO_INCREMENT,
     kit_no          VARCHAR(30)  NOT NULL COMMENT '套件编号',
@@ -296,12 +340,14 @@ CREATE TABLE cut_kit (
     KEY idx_cut_kit_status (status)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '裁片套件';
 
--- 裁片台账：清单行(EXPECTED)与实际扫码片(PACKING/RECEIVING/RESOLVE)同表
+-- 套件裁片台账：清单行(EXPECTED)与实际扫码片(SCANNED)同表，phase 区分
+-- PACKING：封包阶段；RECEIVING：接收复核阶段；RESOLVE：异常补齐复核阶段。
+-- 接收/复核每轮重扫另存新 phase，封包后的历史记录永不删除。
 CREATE TABLE cut_kit_piece (
     id                BIGINT       NOT NULL AUTO_INCREMENT,
     kit_id            BIGINT       NOT NULL COMMENT '所属套件',
     phase             VARCHAR(12)  NOT NULL COMMENT 'EXPECTED(清单) / PACKING / RECEIVING / RESOLVE',
-    seq               INT          NOT NULL DEFAULT 0 COMMENT '套件内扫描序号',
+    seq               INT          NOT NULL DEFAULT 0 COMMENT '套件内扫描序号（扫码顺序留痕）',
     piece_code        VARCHAR(60)  COMMENT '裁片条码/剪片标识（清单行可空，实际片必填）',
     part              VARCHAR(30)  NOT NULL COMMENT '部位 FRONT/BACK/SLEEVE/COLLAR/LINING/...',
     side              VARCHAR(10)  NOT NULL DEFAULT 'CENTER' COMMENT '左右侧 LEFT/RIGHT/CENTER',
@@ -315,6 +361,7 @@ CREATE TABLE cut_kit_piece (
     KEY idx_ckp_kit_phase (kit_id, phase)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '套件裁片台账（清单+实际扫码）';
 
+-- 套件异常单：交接后发现漏片/混片时登记；补齐并复核通过后关闭，套件回到已交接状态
 CREATE TABLE cut_kit_exception (
     id              BIGINT       NOT NULL AUTO_INCREMENT,
     exception_no    VARCHAR(30)  NOT NULL COMMENT '异常单号',
@@ -332,23 +379,24 @@ CREATE TABLE cut_kit_exception (
     KEY idx_cke_kit (kit_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '裁片套件异常单';
 
+-- 幂等键：交接/接收等关键写操作携带客户端请求号，同号重放返回首次结果，不产生第二条记录
 CREATE TABLE cut_kit_idempotency (
     id            BIGINT       NOT NULL AUTO_INCREMENT,
-    idem_key      VARCHAR(80)  NOT NULL COMMENT '幂等键（操作类型:套件:请求号）',
+    idem_key      VARCHAR(80)  NOT NULL COMMENT '幂等键（建议 操作类型:套件:请求号）',
     kit_id        BIGINT       NOT NULL,
     action        VARCHAR(20)  NOT NULL COMMENT 'HAND_OVER/RECEIVE/...',
     response_json MEDIUMTEXT   NOT NULL COMMENT '首次成功响应快照（重放原样返回）',
-    http_status   INT          NOT NULL DEFAULT 200,
+    http_status   INT          NOT NULL DEFAULT 200 COMMENT '首次响应 HTTP 状态（重放保持一致）',
     created_at    DATETIME     NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_cki_key (idem_key)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '套件关键操作幂等记录';
 
--- 事件时间线：只追加、永不更新/删除
+-- 套件事件时间线：只追加、永不更新/删除；状态变化、差异项、处理人、前后快照全部在案
 CREATE TABLE cut_kit_event (
     id            BIGINT       NOT NULL AUTO_INCREMENT,
     kit_id        BIGINT       NOT NULL COMMENT '所属套件',
-    event_type    VARCHAR(24)  NOT NULL COMMENT 'CREATE/UPDATE_MANIFEST/SCAN_PIECE/VALIDATE/SEAL/UNSEAL/HAND_OVER/RECEIVE_FAIL/RECEIVE/RAISE_EXCEPTION/RESOLVE_EXCEPTION',
+    event_type    VARCHAR(24)  NOT NULL COMMENT 'CREATE/UPDATE_MANIFEST/SCAN_PIECE/REMOVE_SCAN/VALIDATE/SEAL/UNSEAL/HAND_OVER/RECEIVE_FAIL/RECEIVE/RAISE_EXCEPTION/RESOLVE_EXCEPTION',
     from_status   VARCHAR(20)  COMMENT '操作前套件状态',
     to_status     VARCHAR(20)  COMMENT '操作后套件状态',
     operator      VARCHAR(50)  NOT NULL COMMENT '操作人',
@@ -436,6 +484,27 @@ INSERT INTO custom_order (id, order_no, customer_id, style_id, fabric_id, measur
   (12, 'ORD-20260012', 12, 3, 6, 12, 4.00, '2026-08-25', '2026-09-28', 1640.00, 5680.00, 7320.00, 3660.00, 3660.00, 1, 0, 'FINISHED', '整体完成待出仓，尾款未结'),
   (13, 'ORD-20260013', 1, 2, 9, 1, 3.60, '2026-08-19', '2026-09-25', 1396.80, 3280.00, 4676.80, 2338.40, 2338.40, 1, 1, 'DELIVERED', '已交付，客户很满意'),
   (14, 'ORD-20260014', 5, 7, 3, 5, 5.60, '2026-08-13', '2026-09-19', 1792.00, 8800.00, 10592.00, 5296.00, 5296.00, 1, 1, 'DELIVERED', '婚礼已办完');
+
+-- ---------- 订单量体快照（下单即冻结；与上方订单一一对应，尺寸来自当时采用的量体记录） ----------
+INSERT INTO order_measurement_snapshot
+  (order_id, measurement_id, record_no, customer_name, tailor_name, measure_date,
+   bust, waist, hip, shoulder, sleeve_len, body_len, pants_len, measure_remark,
+   status, source, frozen_at) VALUES
+  (1,  1,  'ME-4001', '沈曼青', '方绮', '2026-08-22', 86.00, 68.00, 92.00, 38.00, 57.00, 62.00, 96.00, '常穿高跟鞋，裤长加 2cm', 'FROZEN', 'FROZEN', '2026-09-20 09:00:00'),
+  (2,  2,  'ME-4002', '顾知微', '方绮', '2026-08-23', 90.00, 74.00, 97.00, 39.50, 58.00, 65.00, 99.00, '肩部略偏，需调版', 'FROZEN', 'FROZEN', '2026-09-19 09:00:00'),
+  (3,  3,  'ME-4003', '林婉仪', '罗予', '2026-08-24', 82.00, 63.00, 88.00, 36.50, 55.00, 58.00, 92.00, '偏好收腰明显', 'FROZEN', 'FROZEN', '2026-09-16 09:00:00'),
+  (4,  4,  'ME-4004', '裴盈盈', '罗予', '2026-08-25', 88.00, 70.00, 95.00, 38.50, 56.50, 63.00, 97.00, '第一次定制，留放余量', 'FROZEN', 'FROZEN', '2026-09-15 09:00:00'),
+  (5,  5,  'ME-4005', '苏未晚', '方绮', '2026-08-27', 92.00, 76.00, 99.00, 40.00, 59.00, 66.00, 101.00, '孕期后复尺', 'FROZEN', 'FROZEN', '2026-09-10 09:00:00'),
+  (6,  6,  'ME-4006', '周静姝', '罗予', '2026-08-29', 84.00, 66.00, 90.00, 37.00, 55.50, 60.00, 94.00, '袖长偏短 1cm', 'FROZEN', 'FROZEN', '2026-09-09 09:00:00'),
+  (7,  7,  'ME-4007', '何以柔', '莫岑', '2026-08-31', 87.00, 71.00, 94.00, 38.00, 57.50, 61.00, 95.00, '要求加薄垫肩', 'FROZEN', 'FROZEN', '2026-09-06 09:00:00'),
+  (8,  8,  'ME-4008', '白锦瑟', '莫岑', '2026-09-02', 80.00, 42.00, 86.00, 35.50, 54.00, 56.00, 90.00, '腰围超小，需单独开版', 'FROZEN', 'FROZEN', '2026-09-04 09:00:00'),
+  (9,  9,  'ME-4009', '傅清让', '莫岑', '2026-09-04', 98.00, 85.00, 100.00, 45.00, 62.00, 72.00, 104.00, '男士西服套装', 'FROZEN', 'FROZEN', '2026-09-08 09:00:00'),
+  (10, 10, 'ME-4010', '江宴如', '方绮', '2026-09-06', 85.00, 67.00, 91.00, 37.50, 56.00, 61.00, 93.00, '偏好宽松版型', 'FROZEN', 'FROZEN', '2026-09-01 09:00:00'),
+  (11, 11, 'ME-4011', '宋亦舒', '罗予', '2026-09-08', 89.00, 73.00, 96.00, 39.00, 57.00, 64.00, 98.00, '二次复尺，数据稳定', 'FROZEN', 'FROZEN', '2026-08-29 09:00:00'),
+  (12, 12, 'ME-4012', '陆时宜', '莫岑', '2026-09-10', 83.00, 65.00, 89.00, 36.00, 55.00, 59.00, 91.00, '礼服专用净体尺寸', 'FROZEN', 'FROZEN', '2026-08-25 09:00:00'),
+  (13, 1,  'ME-4001', '沈曼青', '方绮', '2026-08-22', 86.00, 68.00, 92.00, 38.00, 57.00, 62.00, 96.00, '常穿高跟鞋，裤长加 2cm', 'FROZEN', 'FROZEN', '2026-08-19 09:00:00'),
+  (14, 5,  'ME-4005', '苏未晚', '方绮', '2026-08-27', 92.00, 76.00, 99.00, 40.00, 59.00, 66.00, 101.00, '孕期后复尺', 'FROZEN', 'FROZEN', '2026-08-13 09:00:00');
+
 
 -- ---------- 工序工单 ----------
 INSERT INTO work_order (id, wo_no, order_id, step, owner, planned_hours, actual_hours, status, remark) VALUES
@@ -531,3 +600,26 @@ INSERT INTO fitting_action_log
   (14, 4, 11, 4, 'FINISH_REWORK', '王姐', 'REWORKING', 'REWORKING', '返修完成，实耗 0.4 小时', '2026-09-22 17:30:00'),
   (15, 4, 11, 4, 'SUBMIT_REVIEW', '王姐', 'REWORKING', 'REVIEWING', '提交复核', '2026-09-22 17:35:00'),
   (16, 4, 11, 4, 'REVIEW_PASS', '方绮', 'REVIEWING', 'CLOSED', '复验线迹隐蔽，通过', '2026-09-23 11:40:00');
+
+-- ---------- 模块七：放码方案种子 ----------
+-- GR-7001：现代方案，含固定/比例/分段三种规则、左右不对称基准（左半肩 19.8 / 右半肩 19.7cm）、升码降码
+INSERT INTO grade_scheme
+  (id, scheme_no, name, style_id, status, base_size_code, input_unit, round_step_mm,
+   sizes_json, bases_json, rules_json, snapshot_json, legacy_flag, result_version, created_at, updated_at) VALUES
+  (1, 'GR-7001', '经典西装六码放码表（多规则）', 1, 'SAVED', 'M', 'CM', 1.00,
+   '["XS","S","M","L","XL","XXL"]',
+   '[{"part":"bust","side":"CENTER","valueMm":900},{"part":"waist","side":"CENTER","valueMm":740},{"part":"hip","side":"CENTER","valueMm":970},{"part":"bodyLength","side":"CENTER","valueMm":650},{"part":"shoulder","side":"LEFT","valueMm":198},{"part":"shoulder","side":"RIGHT","valueMm":197},{"part":"sleeveLength","side":"LEFT","valueMm":580},{"part":"sleeveLength","side":"RIGHT","valueMm":580}]',
+   '[{"part":"bust","side":"CENTER","ruleType":"FIXED","fixedDeltaMm":40},{"part":"waist","side":"CENTER","ruleType":"RATIO","ratioPercent":4},{"part":"hip","side":"CENTER","ruleType":"FIXED","fixedDeltaMm":36},{"part":"bodyLength","side":"CENTER","ruleType":"FIXED","fixedDeltaMm":20},{"part":"shoulder","side":"LEFT","ruleType":"SEGMENT","segments":[{"fromLevel":-2,"toLevel":-1,"deltaMm":6},{"fromLevel":0,"toLevel":1,"deltaMm":4},{"fromLevel":2,"toLevel":3,"deltaMm":8}]},{"part":"shoulder","side":"RIGHT","ruleType":"SEGMENT","segments":[{"fromLevel":-2,"toLevel":-1,"deltaMm":6},{"fromLevel":0,"toLevel":1,"deltaMm":4},{"fromLevel":2,"toLevel":3,"deltaMm":8}]},{"part":"sleeveLength","side":"LEFT","ruleType":"FIXED","fixedDeltaMm":15},{"part":"sleeveLength","side":"RIGHT","ruleType":"FIXED","fixedDeltaMm":15}]',
+   '{"baseSizeCode":"M","baseLevel":0,"inputUnit":"CM","roundStepMm":1,"sizes":["XS","S","M","L","XL","XXL"],"levels":[-2,-1,0,1,2,3],"parts":[{"part":"bust","side":"CENTER","ruleType":"FIXED","formula":"最终尺寸 = 90cm + 级序 × +4cm","cells":[{"sizeCode":"XS","level":-2,"rawMm":820,"valueMm":820,"valueCm":82,"deltaMm":-80},{"sizeCode":"S","level":-1,"rawMm":860,"valueMm":860,"valueCm":86,"deltaMm":-40},{"sizeCode":"M","level":0,"rawMm":900,"valueMm":900,"valueCm":90,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":940,"valueMm":940,"valueCm":94,"deltaMm":40},{"sizeCode":"XL","level":2,"rawMm":980,"valueMm":980,"valueCm":98,"deltaMm":80},{"sizeCode":"XXL","level":3,"rawMm":1020,"valueMm":1020,"valueCm":102,"deltaMm":120}]},{"part":"waist","side":"CENTER","ruleType":"RATIO","formula":"最终尺寸 = 74cm × (1 + 级序 × 4%)","cells":[{"sizeCode":"XS","level":-2,"rawMm":680.8,"valueMm":681,"valueCm":68.1,"deltaMm":-59},{"sizeCode":"S","level":-1,"rawMm":710.4,"valueMm":710,"valueCm":71,"deltaMm":-30},{"sizeCode":"M","level":0,"rawMm":740,"valueMm":740,"valueCm":74,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":769.6,"valueMm":770,"valueCm":77,"deltaMm":30},{"sizeCode":"XL","level":2,"rawMm":799.2,"valueMm":799,"valueCm":79.9,"deltaMm":59},{"sizeCode":"XXL","level":3,"rawMm":828.8,"valueMm":829,"valueCm":82.9,"deltaMm":89}]},{"part":"hip","side":"CENTER","ruleType":"FIXED","formula":"最终尺寸 = 97cm + 级序 × +3.6cm","cells":[{"sizeCode":"XS","level":-2,"rawMm":898,"valueMm":898,"valueCm":89.8,"deltaMm":-72},{"sizeCode":"S","level":-1,"rawMm":934,"valueMm":934,"valueCm":93.4,"deltaMm":-36},{"sizeCode":"M","level":0,"rawMm":970,"valueMm":970,"valueCm":97,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":1006,"valueMm":1006,"valueCm":100.6,"deltaMm":36},{"sizeCode":"XL","level":2,"rawMm":1042,"valueMm":1042,"valueCm":104.2,"deltaMm":72},{"sizeCode":"XXL","level":3,"rawMm":1078,"valueMm":1078,"valueCm":107.8,"deltaMm":108}]},{"part":"bodyLength","side":"CENTER","ruleType":"FIXED","formula":"最终尺寸 = 65cm + 级序 × +2cm","cells":[{"sizeCode":"XS","level":-2,"rawMm":610,"valueMm":610,"valueCm":61,"deltaMm":-40},{"sizeCode":"S","level":-1,"rawMm":630,"valueMm":630,"valueCm":63,"deltaMm":-20},{"sizeCode":"M","level":0,"rawMm":650,"valueMm":650,"valueCm":65,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":670,"valueMm":670,"valueCm":67,"deltaMm":20},{"sizeCode":"XL","level":2,"rawMm":690,"valueMm":690,"valueCm":69,"deltaMm":40},{"sizeCode":"XXL","level":3,"rawMm":710,"valueMm":710,"valueCm":71,"deltaMm":60}]},{"part":"shoulder","side":"LEFT","ruleType":"SEGMENT","formula":"分段累计（相对基准级序 0）：级序 -2~-1：每升一级 +0.6cm；级序 0~+1：每升一级 +0.4cm；级序 +2~+3：每升一级 +0.8cm","cells":[{"sizeCode":"XS","level":-2,"rawMm":188,"valueMm":188,"valueCm":18.8,"deltaMm":-10},{"sizeCode":"S","level":-1,"rawMm":194,"valueMm":194,"valueCm":19.4,"deltaMm":-4},{"sizeCode":"M","level":0,"rawMm":198,"valueMm":198,"valueCm":19.8,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":202,"valueMm":202,"valueCm":20.2,"deltaMm":4},{"sizeCode":"XL","level":2,"rawMm":206,"valueMm":206,"valueCm":20.6,"deltaMm":8},{"sizeCode":"XXL","level":3,"rawMm":214,"valueMm":214,"valueCm":21.4,"deltaMm":16}]},{"part":"shoulder","side":"RIGHT","ruleType":"SEGMENT","formula":"分段累计（相对基准级序 0）：级序 -2~-1：每升一级 +0.6cm；级序 0~+1：每升一级 +0.4cm；级序 +2~+3：每升一级 +0.8cm","cells":[{"sizeCode":"XS","level":-2,"rawMm":187,"valueMm":187,"valueCm":18.7,"deltaMm":-10},{"sizeCode":"S","level":-1,"rawMm":193,"valueMm":193,"valueCm":19.3,"deltaMm":-4},{"sizeCode":"M","level":0,"rawMm":197,"valueMm":197,"valueCm":19.7,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":201,"valueMm":201,"valueCm":20.1,"deltaMm":4},{"sizeCode":"XL","level":2,"rawMm":205,"valueMm":205,"valueCm":20.5,"deltaMm":8},{"sizeCode":"XXL","level":3,"rawMm":213,"valueMm":213,"valueCm":21.3,"deltaMm":16}]},{"part":"sleeveLength","side":"LEFT","ruleType":"FIXED","formula":"最终尺寸 = 58cm + 级序 × +1.5cm","cells":[{"sizeCode":"XS","level":-2,"rawMm":550,"valueMm":550,"valueCm":55,"deltaMm":-30},{"sizeCode":"S","level":-1,"rawMm":565,"valueMm":565,"valueCm":56.5,"deltaMm":-15},{"sizeCode":"M","level":0,"rawMm":580,"valueMm":580,"valueCm":58,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":595,"valueMm":595,"valueCm":59.5,"deltaMm":15},{"sizeCode":"XL","level":2,"rawMm":610,"valueMm":610,"valueCm":61,"deltaMm":30},{"sizeCode":"XXL","level":3,"rawMm":625,"valueMm":625,"valueCm":62.5,"deltaMm":45}]},{"part":"sleeveLength","side":"RIGHT","ruleType":"FIXED","formula":"最终尺寸 = 58cm + 级序 × +1.5cm","cells":[{"sizeCode":"XS","level":-2,"rawMm":550,"valueMm":550,"valueCm":55,"deltaMm":-30},{"sizeCode":"S","level":-1,"rawMm":565,"valueMm":565,"valueCm":56.5,"deltaMm":-15},{"sizeCode":"M","level":0,"rawMm":580,"valueMm":580,"valueCm":58,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":595,"valueMm":595,"valueCm":59.5,"deltaMm":15},{"sizeCode":"XL","level":2,"rawMm":610,"valueMm":610,"valueCm":61,"deltaMm":30},{"sizeCode":"XXL","level":3,"rawMm":625,"valueMm":625,"valueCm":62.5,"deltaMm":45}]}],"issues":[],"elapsedMs":0}',
+   0, 1, '2026-09-26 10:00:00', '2026-09-26 10:00:00');
+
+-- GR-7099：旧厘米系统迁移数据，只有厘米两位小数；按兼容规则（round_step_mm=0.1）读入，结果与旧系统一致
+INSERT INTO grade_scheme
+  (id, scheme_no, name, style_id, status, base_size_code, input_unit, round_step_mm,
+   sizes_json, bases_json, rules_json, snapshot_json, legacy_flag, result_version, created_at, updated_at) VALUES
+  (2, 'GR-7099', '旧版三码放码表（厘米迁移）', 12, 'SAVED', 'M', 'CM', 0.10,
+   '["S","M","L"]',
+   '[{"part":"bust","side":"CENTER","valueMm":880},{"part":"waist","side":"CENTER","valueMm":720},{"part":"hip","side":"CENTER","valueMm":940},{"part":"bodyLength","side":"CENTER","valueMm":620},{"part":"shoulder","side":"LEFT","valueMm":192.5},{"part":"shoulder","side":"RIGHT","valueMm":192.5},{"part":"sleeveLength","side":"LEFT","valueMm":570},{"part":"sleeveLength","side":"RIGHT","valueMm":570}]',
+   '[{"part":"bust","side":"CENTER","ruleType":"FIXED","fixedDeltaMm":40},{"part":"waist","side":"CENTER","ruleType":"FIXED","fixedDeltaMm":30},{"part":"hip","side":"CENTER","ruleType":"FIXED","fixedDeltaMm":35},{"part":"bodyLength","side":"CENTER","ruleType":"FIXED","fixedDeltaMm":15},{"part":"shoulder","side":"LEFT","ruleType":"FIXED","fixedDeltaMm":5},{"part":"shoulder","side":"RIGHT","ruleType":"FIXED","fixedDeltaMm":5},{"part":"sleeveLength","side":"LEFT","ruleType":"FIXED","fixedDeltaMm":10},{"part":"sleeveLength","side":"RIGHT","ruleType":"FIXED","fixedDeltaMm":10}]',
+   '{"baseSizeCode":"M","baseLevel":0,"inputUnit":"CM","roundStepMm":0.1,"sizes":["S","M","L"],"levels":[-1,0,1],"parts":[{"part":"bust","side":"CENTER","ruleType":"FIXED","formula":"最终尺寸 = 88cm + 级序 × +4cm","cells":[{"sizeCode":"S","level":-1,"rawMm":840,"valueMm":840,"valueCm":84,"deltaMm":-40},{"sizeCode":"M","level":0,"rawMm":880,"valueMm":880,"valueCm":88,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":920,"valueMm":920,"valueCm":92,"deltaMm":40}]},{"part":"waist","side":"CENTER","ruleType":"FIXED","formula":"最终尺寸 = 72cm + 级序 × +3cm","cells":[{"sizeCode":"S","level":-1,"rawMm":690,"valueMm":690,"valueCm":69,"deltaMm":-30},{"sizeCode":"M","level":0,"rawMm":720,"valueMm":720,"valueCm":72,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":750,"valueMm":750,"valueCm":75,"deltaMm":30}]},{"part":"hip","side":"CENTER","ruleType":"FIXED","formula":"最终尺寸 = 94cm + 级序 × +3.5cm","cells":[{"sizeCode":"S","level":-1,"rawMm":905,"valueMm":905,"valueCm":90.5,"deltaMm":-35},{"sizeCode":"M","level":0,"rawMm":940,"valueMm":940,"valueCm":94,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":975,"valueMm":975,"valueCm":97.5,"deltaMm":35}]},{"part":"bodyLength","side":"CENTER","ruleType":"FIXED","formula":"最终尺寸 = 62cm + 级序 × +1.5cm","cells":[{"sizeCode":"S","level":-1,"rawMm":605,"valueMm":605,"valueCm":60.5,"deltaMm":-15},{"sizeCode":"M","level":0,"rawMm":620,"valueMm":620,"valueCm":62,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":635,"valueMm":635,"valueCm":63.5,"deltaMm":15}]},{"part":"shoulder","side":"LEFT","ruleType":"FIXED","formula":"最终尺寸 = 19.25cm + 级序 × +0.5cm","cells":[{"sizeCode":"S","level":-1,"rawMm":187.5,"valueMm":187.5,"valueCm":18.75,"deltaMm":-5},{"sizeCode":"M","level":0,"rawMm":192.5,"valueMm":192.5,"valueCm":19.25,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":197.5,"valueMm":197.5,"valueCm":19.75,"deltaMm":5}]},{"part":"shoulder","side":"RIGHT","ruleType":"FIXED","formula":"最终尺寸 = 19.25cm + 级序 × +0.5cm","cells":[{"sizeCode":"S","level":-1,"rawMm":187.5,"valueMm":187.5,"valueCm":18.75,"deltaMm":-5},{"sizeCode":"M","level":0,"rawMm":192.5,"valueMm":192.5,"valueCm":19.25,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":197.5,"valueMm":197.5,"valueCm":19.75,"deltaMm":5}]},{"part":"sleeveLength","side":"LEFT","ruleType":"FIXED","formula":"最终尺寸 = 57cm + 级序 × +1cm","cells":[{"sizeCode":"S","level":-1,"rawMm":560,"valueMm":560,"valueCm":56,"deltaMm":-10},{"sizeCode":"M","level":0,"rawMm":570,"valueMm":570,"valueCm":57,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":580,"valueMm":580,"valueCm":58,"deltaMm":10}]},{"part":"sleeveLength","side":"RIGHT","ruleType":"FIXED","formula":"最终尺寸 = 57cm + 级序 × +1cm","cells":[{"sizeCode":"S","level":-1,"rawMm":560,"valueMm":560,"valueCm":56,"deltaMm":-10},{"sizeCode":"M","level":0,"rawMm":570,"valueMm":570,"valueCm":57,"deltaMm":0},{"sizeCode":"L","level":1,"rawMm":580,"valueMm":580,"valueCm":58,"deltaMm":10}]}],"issues":[],"elapsedMs":0}',
+   1, 1, '2026-09-26 10:00:00', '2026-09-26 10:00:00');

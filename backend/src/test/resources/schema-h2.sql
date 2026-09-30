@@ -1,5 +1,194 @@
--- 集成测试专用 H2（MySQL 兼容模式）建表：只建裁片套件模块用到的 5 张表，
--- 结构与主 schema.sql 保持一致；H2 不支持 MySQL 的 GENERATED 列，本模块也未使用。
+-- 集成测试专用 H2（MySQL 兼容模式）建表：覆盖全部 JPA 实体，
+-- 结构与主 schema.sql 保持一致；H2 不支持 MySQL 的 GENERATED 列，放码/返修模块测试未使用。
+
+CREATE TABLE IF NOT EXISTS customer (
+    id           BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    customer_no  VARCHAR(30)  NOT NULL UNIQUE,
+    name         VARCHAR(50)  NOT NULL,
+    phone        VARCHAR(20)  NOT NULL,
+    gender       VARCHAR(10)  NOT NULL,
+    vip_level    VARCHAR(20)  NOT NULL DEFAULT 'NORMAL'
+);
+
+CREATE TABLE IF NOT EXISTS style (
+    id          BIGINT        NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    style_no    VARCHAR(30)   NOT NULL UNIQUE,
+    name        VARCHAR(80)   NOT NULL,
+    category    VARCHAR(20)   NOT NULL,
+    base_price  DECIMAL(10,2) NOT NULL,
+    craft_level INT           NOT NULL,
+    on_sale     TINYINT(1)    NOT NULL DEFAULT 1,
+    remark      VARCHAR(200)
+);
+
+CREATE TABLE IF NOT EXISTS measurement (
+    id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    record_no     VARCHAR(30)  NOT NULL UNIQUE,
+    customer_id   BIGINT       NOT NULL,
+    customer_name VARCHAR(50)  NOT NULL,
+    tailor_name   VARCHAR(50)  NOT NULL,
+    measure_date  DATE         NOT NULL,
+    bust          DECIMAL(6,2) NOT NULL,
+    waist         DECIMAL(6,2) NOT NULL,
+    hip           DECIMAL(6,2) NOT NULL,
+    shoulder      DECIMAL(6,2) NOT NULL,
+    sleeve_len    DECIMAL(6,2) NOT NULL,
+    body_len      DECIMAL(6,2) NOT NULL,
+    pants_len     DECIMAL(6,2) NOT NULL,
+    remark        VARCHAR(500),
+    version       INT          NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_msr_customer ON measurement (customer_id);
+
+CREATE TABLE IF NOT EXISTS fabric (
+    id           BIGINT        NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    fabric_no    VARCHAR(30)   NOT NULL UNIQUE,
+    name         VARCHAR(80)   NOT NULL,
+    composition  VARCHAR(20)   NOT NULL,
+    color        VARCHAR(30)   NOT NULL,
+    color_hex    VARCHAR(30)   NOT NULL,
+    stock_meters DECIMAL(10,2) NOT NULL,
+    unit_price   DECIMAL(10,2) NOT NULL,
+    supplier     VARCHAR(80)   NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS custom_order (
+    id             BIGINT        NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    order_no       VARCHAR(30)   NOT NULL UNIQUE,
+    customer_id    BIGINT        NOT NULL,
+    style_id       BIGINT        NOT NULL,
+    fabric_id      BIGINT        NOT NULL,
+    measurement_id BIGINT,
+    usage_meters   DECIMAL(10,2) NOT NULL,
+    order_date     DATE          NOT NULL,
+    delivery_date  DATE          NOT NULL,
+    fabric_cost    DECIMAL(10,2) NOT NULL,
+    craft_fee      DECIMAL(10,2) NOT NULL,
+    total_price    DECIMAL(10,2) NOT NULL,
+    deposit        DECIMAL(10,2) NOT NULL,
+    balance        DECIMAL(10,2) NOT NULL,
+    deposit_paid   TINYINT(1)    NOT NULL DEFAULT 0,
+    balance_paid   TINYINT(1)    NOT NULL DEFAULT 0,
+    status         VARCHAR(20)   NOT NULL,
+    remark         VARCHAR(500)
+);
+CREATE INDEX IF NOT EXISTS idx_order_status ON custom_order (status);
+
+CREATE TABLE IF NOT EXISTS order_measurement_snapshot (
+    id             BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    order_id       BIGINT       NOT NULL UNIQUE,
+    measurement_id BIGINT,
+    record_no      VARCHAR(30),
+    customer_name  VARCHAR(50),
+    tailor_name    VARCHAR(50),
+    measure_date   DATE,
+    bust           DECIMAL(6,2),
+    waist          DECIMAL(6,2),
+    hip            DECIMAL(6,2),
+    shoulder       DECIMAL(6,2),
+    sleeve_len     DECIMAL(6,2),
+    body_len       DECIMAL(6,2),
+    pants_len      DECIMAL(6,2),
+    measure_remark VARCHAR(500),
+    status         VARCHAR(20)  NOT NULL DEFAULT 'FROZEN',
+    source         VARCHAR(20)  NOT NULL DEFAULT 'FROZEN',
+    frozen_at      TIMESTAMP    NOT NULL,
+    backfilled_at  TIMESTAMP,
+    verify_note    VARCHAR(500),
+    confirmed_by   VARCHAR(50),
+    confirmed_at   TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_oms_measurement ON order_measurement_snapshot (measurement_id);
+
+CREATE TABLE IF NOT EXISTS work_order (
+    id            BIGINT        NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    wo_no         VARCHAR(30)   NOT NULL UNIQUE,
+    order_id      BIGINT        NOT NULL,
+    step          VARCHAR(20)   NOT NULL,
+    owner         VARCHAR(50)   NOT NULL,
+    planned_hours DECIMAL(8,2)  NOT NULL,
+    actual_hours  DECIMAL(8,2)  NOT NULL DEFAULT 0,
+    status        VARCHAR(20)   NOT NULL,
+    remark        VARCHAR(500)
+);
+CREATE INDEX IF NOT EXISTS idx_work_order_order ON work_order (order_id);
+
+CREATE TABLE IF NOT EXISTS fitting_issue (
+    id               BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    issue_no         VARCHAR(30)  NOT NULL UNIQUE,
+    order_id         BIGINT       NOT NULL,
+    body_part        VARCHAR(30)  NOT NULL,
+    severity         VARCHAR(20)  NOT NULL,
+    description      VARCHAR(500) NOT NULL,
+    responsible_step VARCHAR(20)  NOT NULL,
+    raised_by        VARCHAR(50)  NOT NULL,
+    raised_at        TIMESTAMP    NOT NULL,
+    status           VARCHAR(20)  NOT NULL,
+    released         TINYINT(1)   NOT NULL DEFAULT 0,
+    closed_at        TIMESTAMP,
+    reopen_count     INT          NOT NULL DEFAULT 0,
+    version          INT          NOT NULL DEFAULT 0,
+    remark           VARCHAR(500)
+);
+CREATE INDEX IF NOT EXISTS idx_fi_order ON fitting_issue (order_id);
+CREATE INDEX IF NOT EXISTS idx_fi_status ON fitting_issue (status);
+
+CREATE TABLE IF NOT EXISTS fitting_rework_round (
+    id               BIGINT        NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    round_no         VARCHAR(30)   NOT NULL UNIQUE,
+    issue_id         BIGINT        NOT NULL,
+    order_id         BIGINT        NOT NULL,
+    round_seq        INT           NOT NULL,
+    responsible_step VARCHAR(20)   NOT NULL,
+    owner            VARCHAR(50)   NOT NULL,
+    planned_hours    DECIMAL(8,2)  NOT NULL,
+    actual_hours     DECIMAL(8,2)  NOT NULL DEFAULT 0,
+    rework_reason    VARCHAR(500)  NOT NULL,
+    status           VARCHAR(20)   NOT NULL,
+    started_at       TIMESTAMP     NOT NULL,
+    finished_at      TIMESTAMP,
+    reviewed_at      TIMESTAMP,
+    reviewer         VARCHAR(50),
+    review_comment   VARCHAR(500)
+);
+CREATE INDEX IF NOT EXISTS idx_frr_issue ON fitting_rework_round (issue_id);
+CREATE INDEX IF NOT EXISTS idx_frr_order ON fitting_rework_round (order_id);
+
+CREATE TABLE IF NOT EXISTS fitting_action_log (
+    id          BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    issue_id    BIGINT,
+    order_id    BIGINT       NOT NULL,
+    round_id    BIGINT,
+    action      VARCHAR(30)  NOT NULL,
+    operator    VARCHAR(50)  NOT NULL,
+    from_status VARCHAR(20),
+    to_status   VARCHAR(20),
+    reason      VARCHAR(500),
+    acted_at    TIMESTAMP    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fal_issue ON fitting_action_log (issue_id);
+CREATE INDEX IF NOT EXISTS idx_fal_order ON fitting_action_log (order_id);
+
+CREATE TABLE IF NOT EXISTS grade_scheme (
+    id             BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    scheme_no      VARCHAR(30)  NOT NULL UNIQUE,
+    name           VARCHAR(80)  NOT NULL,
+    style_id       BIGINT,
+    status         VARCHAR(10)  NOT NULL DEFAULT 'SAVED',
+    base_size_code VARCHAR(20)  NOT NULL,
+    input_unit     VARCHAR(4)   NOT NULL DEFAULT 'CM',
+    round_step_mm  DECIMAL(8,2) NOT NULL DEFAULT 1.00,
+    sizes_json     CLOB         NOT NULL,
+    bases_json     CLOB         NOT NULL,
+    rules_json     CLOB         NOT NULL,
+    snapshot_json  CLOB         NOT NULL,
+    legacy_flag    TINYINT(1)   NOT NULL DEFAULT 0,
+    result_version INT          NOT NULL DEFAULT 1,
+    created_at     TIMESTAMP    NOT NULL,
+    updated_at     TIMESTAMP    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grade_style ON grade_scheme (style_id);
+
 CREATE TABLE IF NOT EXISTS cut_kit (
     id              BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
     kit_no          VARCHAR(30)  NOT NULL UNIQUE,

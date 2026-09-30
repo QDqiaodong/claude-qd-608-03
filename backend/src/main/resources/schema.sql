@@ -29,6 +29,7 @@ DROP TABLE IF EXISTS fitting_action_log;
 DROP TABLE IF EXISTS fitting_rework_round;
 DROP TABLE IF EXISTS fitting_issue;
 DROP TABLE IF EXISTS work_order;
+DROP TABLE IF EXISTS order_measurement_snapshot;
 DROP TABLE IF EXISTS custom_order;
 DROP TABLE IF EXISTS measurement;
 DROP TABLE IF EXISTS fabric;
@@ -86,6 +87,7 @@ CREATE TABLE measurement (
     body_len     DECIMAL(6,2)  NOT NULL COMMENT '衣长 cm',
     pants_len    DECIMAL(6,2)  NOT NULL COMMENT '裤长 cm',
     remark       VARCHAR(500)  COMMENT '备注',
+    version      INT           NOT NULL DEFAULT 0 COMMENT '乐观版本：并发编辑/下单竞争检测',
     PRIMARY KEY (id),
     UNIQUE KEY uk_record_no (record_no),
     KEY idx_msr_customer (customer_id)
@@ -134,6 +136,44 @@ CREATE TABLE custom_order (
     UNIQUE KEY uk_order_no (order_no),
     KEY idx_order_status (status)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '定制订单';
+
+-- ---------------------------------------------------------------------------
+-- 模块四附：订单量体快照
+-- 订单确认（建立）时把当次采用的量体记录完整冻结：尺寸/量体师/量体日期/备注一单一份。
+-- 冻结后与 measurement 解耦——后续编辑/删除量体记录不改写本快照；
+-- 看板、订单详情、工序侧一律读本表。
+-- status：FROZEN(下单冻结/旧数据自动补齐) / PENDING_VERIFY(旧记录缺失，待人工核对，尺寸为空)
+--         / MANUAL_CONFIRMED(人工核对确认，自动补齐永不覆盖)
+-- source：FROZEN(下单时) / BACKFILL(旧订单补齐)
+-- ---------------------------------------------------------------------------
+CREATE TABLE order_measurement_snapshot (
+    id             BIGINT        NOT NULL AUTO_INCREMENT,
+    order_id       BIGINT        NOT NULL COMMENT '所属订单（一单一份）',
+    measurement_id BIGINT        COMMENT '来源量体记录（旧记录缺失的待核对快照为空）',
+    record_no      VARCHAR(30)   COMMENT '冻结时量体单号（来源删除后仍可追溯）',
+    customer_name  VARCHAR(50)   COMMENT '客户姓名',
+    tailor_name    VARCHAR(50)   COMMENT '量体师',
+    measure_date   DATE          COMMENT '量体日期',
+    bust           DECIMAL(6,2) COMMENT '胸围 cm（待核对为空，严禁伪造）',
+    waist          DECIMAL(6,2) COMMENT '腰围 cm',
+    hip            DECIMAL(6,2) COMMENT '臀围 cm',
+    shoulder       DECIMAL(6,2) COMMENT '肩宽 cm',
+    sleeve_len     DECIMAL(6,2) COMMENT '袖长 cm',
+    body_len       DECIMAL(6,2) COMMENT '衣长 cm',
+    pants_len      DECIMAL(6,2) COMMENT '裤长 cm',
+    measure_remark VARCHAR(500)  COMMENT '量体备注',
+    status         VARCHAR(20)   NOT NULL DEFAULT 'FROZEN' COMMENT 'FROZEN/PENDING_VERIFY/MANUAL_CONFIRMED',
+    source         VARCHAR(20)   NOT NULL DEFAULT 'FROZEN' COMMENT 'FROZEN/BACKFILL',
+    frozen_at      DATETIME      NOT NULL COMMENT '冻结时间',
+    backfilled_at  DATETIME      COMMENT '补齐时间（旧订单）',
+    verify_note    VARCHAR(500)  COMMENT '待核对/核对说明',
+    confirmed_by   VARCHAR(50)   COMMENT '人工核对操作人',
+    confirmed_at   DATETIME      COMMENT '人工核对时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_order_snapshot (order_id),
+    KEY idx_oms_measurement (measurement_id),
+    KEY idx_oms_status (status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '订单量体快照';
 
 -- ---------------------------------------------------------------------------
 -- 模块五：工序工单
@@ -444,6 +484,27 @@ INSERT INTO custom_order (id, order_no, customer_id, style_id, fabric_id, measur
   (12, 'ORD-20260012', 12, 3, 6, 12, 4.00, '2026-08-25', '2026-09-28', 1640.00, 5680.00, 7320.00, 3660.00, 3660.00, 1, 0, 'FINISHED', '整体完成待出仓，尾款未结'),
   (13, 'ORD-20260013', 1, 2, 9, 1, 3.60, '2026-08-19', '2026-09-25', 1396.80, 3280.00, 4676.80, 2338.40, 2338.40, 1, 1, 'DELIVERED', '已交付，客户很满意'),
   (14, 'ORD-20260014', 5, 7, 3, 5, 5.60, '2026-08-13', '2026-09-19', 1792.00, 8800.00, 10592.00, 5296.00, 5296.00, 1, 1, 'DELIVERED', '婚礼已办完');
+
+-- ---------- 订单量体快照（下单即冻结；与上方订单一一对应，尺寸来自当时采用的量体记录） ----------
+INSERT INTO order_measurement_snapshot
+  (order_id, measurement_id, record_no, customer_name, tailor_name, measure_date,
+   bust, waist, hip, shoulder, sleeve_len, body_len, pants_len, measure_remark,
+   status, source, frozen_at) VALUES
+  (1,  1,  'ME-4001', '沈曼青', '方绮', '2026-08-22', 86.00, 68.00, 92.00, 38.00, 57.00, 62.00, 96.00, '常穿高跟鞋，裤长加 2cm', 'FROZEN', 'FROZEN', '2026-09-20 09:00:00'),
+  (2,  2,  'ME-4002', '顾知微', '方绮', '2026-08-23', 90.00, 74.00, 97.00, 39.50, 58.00, 65.00, 99.00, '肩部略偏，需调版', 'FROZEN', 'FROZEN', '2026-09-19 09:00:00'),
+  (3,  3,  'ME-4003', '林婉仪', '罗予', '2026-08-24', 82.00, 63.00, 88.00, 36.50, 55.00, 58.00, 92.00, '偏好收腰明显', 'FROZEN', 'FROZEN', '2026-09-16 09:00:00'),
+  (4,  4,  'ME-4004', '裴盈盈', '罗予', '2026-08-25', 88.00, 70.00, 95.00, 38.50, 56.50, 63.00, 97.00, '第一次定制，留放余量', 'FROZEN', 'FROZEN', '2026-09-15 09:00:00'),
+  (5,  5,  'ME-4005', '苏未晚', '方绮', '2026-08-27', 92.00, 76.00, 99.00, 40.00, 59.00, 66.00, 101.00, '孕期后复尺', 'FROZEN', 'FROZEN', '2026-09-10 09:00:00'),
+  (6,  6,  'ME-4006', '周静姝', '罗予', '2026-08-29', 84.00, 66.00, 90.00, 37.00, 55.50, 60.00, 94.00, '袖长偏短 1cm', 'FROZEN', 'FROZEN', '2026-09-09 09:00:00'),
+  (7,  7,  'ME-4007', '何以柔', '莫岑', '2026-08-31', 87.00, 71.00, 94.00, 38.00, 57.50, 61.00, 95.00, '要求加薄垫肩', 'FROZEN', 'FROZEN', '2026-09-06 09:00:00'),
+  (8,  8,  'ME-4008', '白锦瑟', '莫岑', '2026-09-02', 80.00, 42.00, 86.00, 35.50, 54.00, 56.00, 90.00, '腰围超小，需单独开版', 'FROZEN', 'FROZEN', '2026-09-04 09:00:00'),
+  (9,  9,  'ME-4009', '傅清让', '莫岑', '2026-09-04', 98.00, 85.00, 100.00, 45.00, 62.00, 72.00, 104.00, '男士西服套装', 'FROZEN', 'FROZEN', '2026-09-08 09:00:00'),
+  (10, 10, 'ME-4010', '江宴如', '方绮', '2026-09-06', 85.00, 67.00, 91.00, 37.50, 56.00, 61.00, 93.00, '偏好宽松版型', 'FROZEN', 'FROZEN', '2026-09-01 09:00:00'),
+  (11, 11, 'ME-4011', '宋亦舒', '罗予', '2026-09-08', 89.00, 73.00, 96.00, 39.00, 57.00, 64.00, 98.00, '二次复尺，数据稳定', 'FROZEN', 'FROZEN', '2026-08-29 09:00:00'),
+  (12, 12, 'ME-4012', '陆时宜', '莫岑', '2026-09-10', 83.00, 65.00, 89.00, 36.00, 55.00, 59.00, 91.00, '礼服专用净体尺寸', 'FROZEN', 'FROZEN', '2026-08-25 09:00:00'),
+  (13, 1,  'ME-4001', '沈曼青', '方绮', '2026-08-22', 86.00, 68.00, 92.00, 38.00, 57.00, 62.00, 96.00, '常穿高跟鞋，裤长加 2cm', 'FROZEN', 'FROZEN', '2026-08-19 09:00:00'),
+  (14, 5,  'ME-4005', '苏未晚', '方绮', '2026-08-27', 92.00, 76.00, 99.00, 40.00, 59.00, 66.00, 101.00, '孕期后复尺', 'FROZEN', 'FROZEN', '2026-08-13 09:00:00');
+
 
 -- ---------- 工序工单 ----------
 INSERT INTO work_order (id, wo_no, order_id, step, owner, planned_hours, actual_hours, status, remark) VALUES

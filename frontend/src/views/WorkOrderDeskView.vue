@@ -66,6 +66,19 @@
               <el-tag size="small" effect="plain" type="danger">{{ steps[row.step] }}</el-tag>
             </template>
           </el-table-column>
+          <el-table-column label="量体快照" width="150">
+            <template #default="{ row }">
+              <template v-if="row.measurementPendingVerify">
+                <el-tag size="small" type="danger">尺寸待核对</el-tag>
+                <div class="gf-muted" style="font-size: 11px">原记录缺失</div>
+              </template>
+              <template v-else-if="row.recordNo">
+                <div style="font-size: 12px">{{ row.recordNo }}</div>
+                <div class="gf-muted" style="font-size: 11.5px">量体师 {{ row.tailorName || '—' }}</div>
+              </template>
+              <span v-else class="gf-muted">—</span>
+            </template>
+          </el-table-column>
           <el-table-column prop="owner" label="负责人" width="90" />
           <el-table-column label="工时(计划/实际)" width="140" align="center">
             <template #default="{ row }">

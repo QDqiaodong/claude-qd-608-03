@@ -23,6 +23,7 @@ import com.garment.factory.dto.PricePreviewDto;
 import com.garment.factory.dto.PricePreviewReq;
 import com.garment.factory.dto.SliceView;
 import com.garment.factory.service.OrderService;
+import com.garment.factory.service.OrderSnapshotService;
 
 /**
  * 定制订单：向导式下单、订单列表、进度看板、状态流转、尾款结算。
@@ -32,9 +33,11 @@ import com.garment.factory.service.OrderService;
 public class OrderController {
 
     private final OrderService orderService;
+    private final OrderSnapshotService snapshotService;
 
-    public OrderController(OrderService orderService) {
+    public OrderController(OrderService orderService, OrderSnapshotService snapshotService) {
         this.orderService = orderService;
+        this.snapshotService = snapshotService;
     }
 
     /** 列表：JPQL 构造器表达式投影 + Slice 滚动分页 */
@@ -61,8 +64,25 @@ public class OrderController {
     }
 
     @GetMapping("/{id}")
-    public ApiResponse<CustomOrder> detail(@PathVariable Long id) {
+    public ApiResponse<Map<String, Object>> detail(@PathVariable Long id) {
         return ApiResponse.success(orderService.detail(id));
+    }
+
+    /**
+     * 旧订单快照补齐：可重复调用（幂等），多人同时处理同一订单只会形成一份快照；
+     * 已人工核对的结果不会被覆盖。返回本次补齐/跳过数量。
+     */
+    @PostMapping("/snapshots/backfill")
+    public ApiResponse<Map<String, Object>> backfillSnapshots() {
+        return ApiResponse.success("旧订单量体快照补齐完成", snapshotService.backfillAll());
+    }
+
+    /** 待核对快照人工确认：原量体记录缺失的旧订单，经人工核对后录入确认尺寸 */
+    @PostMapping("/{id}/snapshot/confirm")
+    public ApiResponse<com.garment.factory.dto.OrderMeasurementSnapshotDto> confirmSnapshot(
+            @PathVariable Long id,
+            @RequestBody OrderSnapshotService.ManualMeasurementReq req) {
+        return ApiResponse.success("量体快照已人工核对确认", snapshotService.confirmPending(id, req));
     }
 
     /** 下单向导第 4 步：实时算价 */

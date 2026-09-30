@@ -30,17 +30,33 @@ public class WorkOrderService {
 
     private final WorkOrderRepository workOrderRepository;
     private final CustomOrderRepository orderRepository;
+    private final OrderSnapshotService snapshotService;
 
-    public WorkOrderService(WorkOrderRepository workOrderRepository, CustomOrderRepository orderRepository) {
+    public WorkOrderService(WorkOrderRepository workOrderRepository, CustomOrderRepository orderRepository,
+                            OrderSnapshotService snapshotService) {
         this.workOrderRepository = workOrderRepository;
         this.orderRepository = orderRepository;
+        this.snapshotService = snapshotService;
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public SliceView<WorkOrderListItemDto> list(Long orderId, String status, String step, String owner,
                                                 String keyword, int page, int size) {
+        PageRequest pageable = PageRequest.of(page, size);
         Slice<WorkOrderListItemDto> slice = workOrderRepository.sliceBy(orderId, trim(status), trim(step),
-                trim(owner), trim(keyword), PageRequest.of(page, size));
+                trim(owner), trim(keyword), pageable);
+        // 工序侧与订单看板同一口径：旧订单缺快照时惰性补齐，工序看到的永远是订单确认时的冻结尺寸。
+        // 补齐后重查一次，保证本次响应里就是冻结结果（而不是等下一次刷新才出现）。
+        boolean missing = slice.getContent().stream().anyMatch(row -> row.getSnapshotStatus() == null);
+        if (missing) {
+            slice.getContent().stream()
+                    .filter(row -> row.getSnapshotStatus() == null)
+                    .map(WorkOrderListItemDto::getOrderId)
+                    .distinct()
+                    .forEach(snapshotService::getOrBackfill);
+            slice = workOrderRepository.sliceBy(orderId, trim(status), trim(step), trim(owner), trim(keyword),
+                    pageable);
+        }
         return SliceView.of(slice);
     }
 

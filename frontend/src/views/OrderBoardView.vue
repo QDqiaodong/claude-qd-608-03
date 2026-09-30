@@ -6,6 +6,9 @@
         <p class="gf-subtitle">横向看板：按状态分列，点开卡片可推进工序与查看工单</p>
       </div>
       <el-button type="primary" plain @click="load">刷新看板</el-button>
+      <el-button type="warning" plain :loading="backfilling" @click="runBackfill">
+        补齐旧订单快照
+      </el-button>
     </div>
 
     <div class="gf-metric-row">
@@ -44,6 +47,10 @@
           <div class="style gf-muted">
             用量 {{ num(card.usageMeters, 1) }} 米 · 交期 {{ day(card.deliveryDate) }}
           </div>
+          <div v-if="card.measurementSnapshot && card.measurementSnapshot.pendingVerify"
+               class="fit-danger" style="font-size: 12px; margin-top: 3px">
+            ⚠ 量体尺寸待核对（原记录缺失）
+          </div>
           <div class="gf-mini-bar">
             <i :style="{ width: progress(card) + '%' }" />
           </div>
@@ -81,8 +88,7 @@
             <div>
               <div style="font-weight: 600">{{ current.customerName }} · {{ current.styleName }}</div>
               <div class="gf-muted" style="font-size: 12.5px">
-                {{ current.fabricName }} · 用量 {{ num(current.usageMeters, 1) }} 米 · 量体师
-                {{ current.tailorName || '—' }}
+                {{ current.fabricName }} · 用量 {{ num(current.usageMeters, 1) }} 米
               </div>
             </div>
             <span class="spacer" style="flex: 1" />
@@ -98,6 +104,49 @@
               结清尾款
             </el-button>
           </div>
+        </div>
+
+        <!-- 订单确认时冻结的量体快照：看板/工序唯一尺寸口径，不随后续量体编辑变化 -->
+        <div class="gf-card" style="padding: 14px; margin-bottom: 14px">
+          <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
+            <h3 class="gf-section-title" style="margin: 0">量体快照（下单已冻结）</h3>
+            <el-tag v-if="snap && snap.status === 'MANUAL_CONFIRMED'" size="small" type="success" effect="plain">
+              人工核对
+            </el-tag>
+            <el-tag v-else-if="snap" size="small" type="info" effect="plain">已冻结</el-tag>
+          </div>
+          <template v-if="snap && !snap.pendingVerify">
+            <div class="gf-muted" style="font-size: 12.5px; margin-bottom: 8px">
+              量体单 {{ snap.recordNo || '—' }} · 量体师 {{ snap.tailorName || '—' }}
+              · 量体日期 {{ day(snap.measureDate) }}
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px">
+              <div v-for="p in measureParts" :key="p.key" class="snap-cell">
+                <div class="gf-muted" style="font-size: 11.5px">{{ p.name }}</div>
+                <div style="font-weight: 600">{{ num(snap[p.key]) }} cm</div>
+              </div>
+            </div>
+            <div v-if="snap.measureRemark" class="gf-muted" style="font-size: 12.5px; margin-top: 8px">
+              量体备注：{{ snap.measureRemark }}
+            </div>
+          </template>
+          <el-alert
+            v-else-if="snap && snap.pendingVerify"
+            type="error"
+            show-icon
+            :closable="false"
+            style="margin-bottom: 10px"
+            title="该旧订单的原量体记录已缺失，尺寸待人工核对，未使用任何替代数据"
+            :description="snap.verifyNote || ''"
+          >
+            <template #default>
+              <div>{{ snap.verifyNote || '原量体记录已删除，无法自动补齐尺寸' }}</div>
+              <el-button size="small" type="warning" plain style="margin-top: 8px" @click="openVerify">
+                人工核对补齐
+              </el-button>
+            </template>
+          </el-alert>
+          <div v-else class="gf-muted">快照加载中…</div>
         </div>
 
         <el-table :data="workOrders" border size="small">
@@ -178,7 +227,17 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { orderApi, workOrderApi, metaApi, fittingApi } from '../api/index.js'
-import { yuan, num, day, daysFromToday } from '../utils/format.js'
+import { yuan, num, day, daysFromToday, todayStr } from '../utils/format.js'
+
+const measureParts = [
+  { key: 'bust', name: '胸围' },
+  { key: 'waist', name: '腰围' },
+  { key: 'hip', name: '臀围' },
+  { key: 'shoulder', name: '肩宽' },
+  { key: 'sleeveLength', name: '袖长' },
+  { key: 'bodyLength', name: '衣长' },
+  { key: 'pantsLength', name: '裤长' }
+]
 
 const columns = reactive({})
 const statusNames = reactive({})
@@ -194,6 +253,48 @@ const reworkRounds = ref([])
 const fittingSummary = ref({})
 const visible = ref(false)
 const current = ref(null)
+const backfilling = ref(false)
+
+/** 抽屉内展示的冻结快照：与看板卡片、工序侧同一份服务端冻结结果 */
+const snap = computed(() => current.value?.measurementSnapshot || null)
+
+async function runBackfill() {
+  backfilling.value = true
+  try {
+    const r = await orderApi.backfillSnapshots()
+    ElMessage.success(`补齐完成：冻结 ${r.frozen} 单，待核对 ${r.pendingVerify} 单，跳过 ${r.skipped} 单`)
+    await load()
+  } finally {
+    backfilling.value = false
+  }
+}
+
+/** 待核对快照的人工核对：由人录入确认的完整尺寸，之后自动补齐不会覆盖 */
+async function openVerify() {
+  const orderId = current.value.id
+  const { value: operator } = await ElMessageBox.prompt('请填写核对操作人', '量体快照人工核对', {
+    inputValue: '方绮',
+    inputValidator: (v) => (v && v.trim()) || '操作人不能为空'
+  })
+  const { value: note } = await ElMessageBox.prompt('请说明尺寸核对依据（如纸质量体单 / 客户复尺）', '核对依据', {
+    inputType: 'textarea',
+    inputValidator: (v) => (v && v.trim()) || '必须填写核对依据'
+  })
+  // 简化录入：用 prompt 收集各部位尺寸（生产环境可换专用表单）
+  const parts = ['bust', 'waist', 'hip', 'shoulder', 'sleeveLength', 'bodyLength', 'pantsLength']
+  const data = { operator, note, measureDate: todayStr(), tailorName: '方绮' }
+  for (const p of parts) {
+    const { value } = await ElMessageBox.prompt(`请输入${measureParts.find((x) => x.key === p).name}（cm）`, '人工核对', {
+      inputPattern: /^\d+(\.\d+)?$/,
+      inputErrorMessage: '请填写数字尺寸'
+    })
+    data[p] = Number(value)
+  }
+  await orderApi.confirmSnapshot(orderId, data)
+  ElMessage.success('快照已人工核对确认')
+  visible.value = false
+  await load()
+}
 
 const dueSoon = computed(
   () => allCards.value.filter((c) => {
@@ -377,6 +478,12 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.snap-cell {
+  background: var(--gf-primary-soft, #fdf2f6);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
 .fit-line {
   margin-top: 8px;
   display: flex;

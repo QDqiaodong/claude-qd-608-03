@@ -2,9 +2,11 @@ package com.garment.factory.dto;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 
 /**
- * 定制订单列表行：由 JPQL 构造器表达式（JOIN 款式/面料/客户/量体）直接投影。
+ * 定制订单列表行：由 JPQL 构造器表达式（JOIN 款式/面料/客户/量体快照）直接投影。
+ * 量体口径来自 order_measurement_snapshot（snap.*），不再 JOIN 可编辑的 measurement 表。
  */
 public class OrderListItemDto {
 
@@ -35,13 +37,23 @@ public class OrderListItemDto {
     private final String status;
     private final String remark;
 
+    /** 冻结量体快照（旧订单未补齐时为 null，由 service 触发惰性补齐后回填） */
+    private OrderMeasurementSnapshotDto measurementSnapshot;
+
     public OrderListItemDto(Long id, String orderNo, Long customerId, String customerName, String phone,
                             String styleNo, String styleName, String category, String fabricNo, String fabricName,
-                            String fabricColor, String colorHex, Long measurementId, String recordNo,
+                            String fabricColor, String colorHex, Long measurementId,
                             BigDecimal usageMeters, LocalDate orderDate, LocalDate deliveryDate,
                             BigDecimal fabricCost, BigDecimal craftFee, BigDecimal totalPrice,
                             BigDecimal deposit, BigDecimal balance, Boolean depositPaid, Boolean balancePaid,
-                            String status, String remark) {
+                            String status, String remark,
+                            // ---- 快照列（SNAPSHOT_COLS，LEFT JOIN，可能全为 null）；recordNo 以冻结快照为准 ----
+                            String snapRecordNo, String snapTailorName, LocalDate snapMeasureDate,
+                            BigDecimal snapBust, BigDecimal snapWaist, BigDecimal snapHip,
+                            BigDecimal snapShoulder, BigDecimal snapSleeveLength, BigDecimal snapBodyLength,
+                            BigDecimal snapPantsLength, String snapMeasureRemark, String snapStatus,
+                            String snapVerifyNote, String snapSource, LocalDateTime snapFrozenAt,
+                            String snapConfirmedBy, Long snapMeasurementId) {
         this.id = id;
         this.orderNo = orderNo;
         this.customerId = customerId;
@@ -55,7 +67,7 @@ public class OrderListItemDto {
         this.fabricColor = fabricColor;
         this.colorHex = colorHex;
         this.measurementId = measurementId;
-        this.recordNo = recordNo;
+        this.recordNo = snapRecordNo;
         this.usageMeters = usageMeters;
         this.orderDate = orderDate;
         this.deliveryDate = deliveryDate;
@@ -68,6 +80,12 @@ public class OrderListItemDto {
         this.balancePaid = balancePaid;
         this.status = status;
         this.remark = remark;
+        if (snapStatus != null) {
+            this.measurementSnapshot = new OrderMeasurementSnapshotDto(snapMeasurementId, snapRecordNo,
+                    snapTailorName, snapMeasureDate, snapBust, snapWaist, snapHip, snapShoulder, snapSleeveLength,
+                    snapBodyLength, snapPantsLength, snapMeasureRemark, snapStatus, snapVerifyNote, snapSource,
+                    snapFrozenAt, snapConfirmedBy);
+        }
     }
 
     public Long getId() {
@@ -172,5 +190,13 @@ public class OrderListItemDto {
 
     public String getRemark() {
         return remark;
+    }
+
+    public OrderMeasurementSnapshotDto getMeasurementSnapshot() {
+        return measurementSnapshot;
+    }
+
+    public void setMeasurementSnapshot(OrderMeasurementSnapshotDto measurementSnapshot) {
+        this.measurementSnapshot = measurementSnapshot;
     }
 }

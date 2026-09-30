@@ -55,6 +55,23 @@
             <el-tag v-else size="small" type="success">正常</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="订单引用" width="150" align="center">
+          <template #default="{ row }">
+            <el-tooltip v-if="(row.activeOrderCount || 0) > 0" placement="top" :show-after="100">
+              <template #content>
+                <div>被 {{ row.activeOrderCount }} 笔未交付订单使用，点「编辑」可查看订单明细；删除会被服务端拒绝</div>
+              </template>
+              <el-tag size="small" type="warning">未交付订单 ×{{ row.activeOrderCount }}</el-tag>
+            </el-tooltip>
+            <el-tooltip v-else-if="(row.deliveredOrderCount || 0) > 0" placement="top" :show-after="100">
+              <template #content>
+                <div>仅 {{ row.deliveredOrderCount }} 笔已交付历史订单引用，快照已留存，可删除</div>
+              </template>
+              <el-tag size="small" type="info">已交付 ×{{ row.deliveredOrderCount }}</el-tag>
+            </el-tooltip>
+            <span v-else class="gf-muted">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="140" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
@@ -69,6 +86,34 @@
     </div>
 
     <el-drawer v-model="drawer" :title="form.id ? '编辑量体记录' : '录入量体'" size="520px">
+      <el-alert
+        v-if="form.id && activeOrders.length"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 12px"
+        title="该记录正被未交付订单使用，本次修改不会同步到这些订单"
+      >
+        <template #default>
+          <div style="line-height: 1.7">
+            订单确认时已冻结尺寸快照，编辑本记录只影响后续新订单：
+            <div v-for="o in activeOrders" :key="o.orderId">
+              · {{ o.orderNo }}（{{ o.statusName }}）仍按确认时的尺寸生产，不会随之变化
+            </div>
+            <div v-if="deliveredOrders.length" class="gf-muted" style="font-size: 12px">
+              另有 {{ deliveredOrders.length }} 笔已交付历史订单同样保留原快照
+            </div>
+          </div>
+        </template>
+      </el-alert>
+      <el-alert
+        v-else-if="form.id && deliveredOrders.length"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 12px"
+        :title="`仅被 ${deliveredOrders.length} 笔已交付历史订单引用，快照已留存，可正常修改/删除`"
+      />
       <el-form label-width="86px">
         <el-form-item label="量体单号">
           <el-input v-model="form.recordNo" placeholder="如 ME-4013" />
@@ -167,6 +212,8 @@ const lowerParts = [
 ]
 
 const form = reactive(blankForm())
+const activeOrders = ref([])
+const deliveredOrders = ref([])
 
 function blankForm() {
   return {
@@ -182,7 +229,8 @@ function blankForm() {
     sleeveLength: 57,
     bodyLength: 62,
     pantsLength: 96,
-    remark: ''
+    remark: '',
+    version: null
   }
 }
 
@@ -239,7 +287,7 @@ function nextNo() {
   return `ME-${4013 + rows.value.length}`
 }
 
-function openEdit(row) {
+async function openEdit(row) {
   Object.assign(form, {
     id: row.id,
     recordNo: row.recordNo,
@@ -253,28 +301,70 @@ function openEdit(row) {
     sleeveLength: Number(row.sleeveLength),
     bodyLength: Number(row.bodyLength),
     pantsLength: Number(row.pantsLength),
-    remark: row.remark
+    remark: row.remark,
+    version: row.version
   })
+  activeOrders.value = []
+  deliveredOrders.value = []
   drawer.value = true
+  // 打开编辑即取服务端最新引用情况：让操作人在动手前知道哪些订单不会随之变化
+  try {
+    const usage = await measurementApi.usage(row.id)
+    activeOrders.value = usage.activeOrders || []
+    deliveredOrders.value = usage.deliveredOrders || []
+  } catch (e) {
+    /* 拦截器已提示 */
+  }
 }
 
 async function submit() {
   saving.value = true
   try {
     await measurementApi.save({ ...form })
-    ElMessage.success('量体记录已保存')
+    ElMessage.success('量体记录已保存（已确认订单的冻结尺寸不受影响）')
     drawer.value = false
     reload()
+  } catch (e) {
+    /* 拦截器已提示并发冲突等错误 */
   } finally {
     saving.value = false
   }
 }
 
 async function remove(row) {
-  await ElMessageBox.confirm(`确认删除量体单「${row.recordNo}」？`, '删除确认', { type: 'warning' })
-  await measurementApi.remove(row.id)
-  ElMessage.success('已删除')
-  reload()
+  // 删除前先取服务端引用事实：阻断原因（哪些未交付订单）由服务端给出，不靠前端隐藏按钮
+  let usage = null
+  try {
+    usage = await measurementApi.usage(row.id)
+  } catch (e) {
+    return
+  }
+  if (usage.blockDelete) {
+    const lines = (usage.activeOrders || [])
+      .map((o) => `· ${o.orderNo}（${o.statusName}）`).join('\n')
+    await ElMessageBox.alert(
+      `量体记录「${row.recordNo}」仍被 ${usage.activeOrders.length} 笔未交付订单使用，服务端已禁止删除：\n${lines}\n\n` +
+      '这些订单已冻结确认时的尺寸快照，删除会丢失来源追溯。如客户尺寸已变化，请新建一条量体记录供后续订单使用。',
+      '删除被阻断',
+      { type: 'error', confirmButtonText: '我知道了' }
+    )
+    return
+  }
+  const deliveredHint = usage.deliveredOrders.length
+    ? `\n该记录仅被 ${usage.deliveredOrders.length} 笔已交付历史订单引用，订单快照保留完整原尺寸，删除不影响历史展示。`
+    : ''
+  await ElMessageBox.confirm(
+    `确认删除量体单「${row.recordNo}」？${deliveredHint}`,
+    '删除确认',
+    { type: 'warning' }
+  )
+  try {
+    await measurementApi.remove(row.id)
+    ElMessage.success('已删除（历史订单仍展示冻结快照）')
+    reload()
+  } catch (e) {
+    /* 并发场景下服务端 409 拦截信息已由拦截器弹出 */
+  }
 }
 
 onMounted(async () => {

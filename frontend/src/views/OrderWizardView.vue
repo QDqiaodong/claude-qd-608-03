@@ -74,7 +74,7 @@
         <el-tabs v-model="measureMode">
           <el-tab-pane label="复用历史量体" name="history">
             <div v-if="historyList.length === 0" class="gf-empty">该客户暂无历史量体记录，请切换到「现场录入」</div>
-            <el-radio-group v-else v-model="order.measurementId" class="msr-radio">
+            <el-radio-group v-else v-model="order.measurementId" class="msr-radio" @change="onPickMeasurement">
               <el-radio v-for="m in historyList" :key="m.id" :value="m.id" class="msr-item">
                 <div class="msr-line">
                   <b>{{ m.recordNo }}</b>
@@ -302,6 +302,7 @@ const submitting = ref(false)
 
 const order = reactive({
   measurementId: null,
+  measurementVersion: null,
   usageMeters: 3.6,
   deliveryDate: addDaysStr(21),
   payDeposit: true,
@@ -415,12 +416,19 @@ async function pickCustomer(c) {
   historyList.value = list
   if (list.length > 0) {
     order.measurementId = list[0].id
+    order.measurementVersion = list[0].version
     measureMode.value = 'history'
   } else {
     order.measurementId = null
+    order.measurementVersion = null
     measureMode.value = 'new'
   }
   msr.recordNo = `ME-${4013 + Math.floor(Math.random() * 500)}`
+}
+
+function onPickMeasurement(id) {
+  const hit = historyList.value.find((m) => m.id === id)
+  order.measurementVersion = hit ? hit.version : null
 }
 
 async function pickStyle(s) {
@@ -475,11 +483,24 @@ async function submit() {
       payDeposit: order.payDeposit,
       remark: order.remark,
       measurementId: measureMode.value === 'history' ? order.measurementId : null,
+      measurementVersion: measureMode.value === 'history' ? order.measurementVersion : null,
       measurement: measureMode.value === 'new' ? { ...msr, customerId: customer.value.id } : null
     }
-    const created = await orderApi.create(payload)
-    ElMessage.success(`订单 ${created.orderNo} 已建立`)
-    router.push('/board')
+    try {
+      const created = await orderApi.create(payload)
+      ElMessage.success(`订单 ${created.orderNo} 已建立，量体尺寸已冻结为订单快照`)
+      router.push('/board')
+    } catch (e) {
+      // 409：下单期间量体记录被他人编辑/删除，必须回到第 2 步基于最新版本重新选择
+      if (e?.response?.status === 409) {
+        ElMessage.error(e.response.data?.message || '量体记录刚被修改，请重新选择')
+        step.value = 1
+        if (customer.value) {
+          historyList.value = await measurementApi.byCustomer(customer.value.id)
+        }
+        order.measurementVersion = null
+      }
+    }
   } finally {
     submitting.value = false
   }

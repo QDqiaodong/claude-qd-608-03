@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.garment.factory.common.BizException;
+import com.garment.factory.common.ConflictException;
 import com.garment.factory.domain.Customer;
 import com.garment.factory.domain.CustomOrder;
 import com.garment.factory.domain.Fabric;
@@ -26,6 +27,7 @@ import com.garment.factory.dto.OrderAdvanceReq;
 import com.garment.factory.dto.OrderBoardCardDto;
 import com.garment.factory.dto.OrderCreateReq;
 import com.garment.factory.dto.OrderListItemDto;
+import com.garment.factory.dto.OrderMeasurementSnapshotDto;
 import com.garment.factory.dto.PricePreviewDto;
 import com.garment.factory.dto.PricePreviewReq;
 import com.garment.factory.dto.SliceView;
@@ -34,11 +36,13 @@ import com.garment.factory.repository.CustomerRepository;
 import com.garment.factory.repository.CustomOrderRepository;
 import com.garment.factory.repository.FabricRepository;
 import com.garment.factory.repository.MeasurementRepository;
+import com.garment.factory.repository.OrderMeasurementSnapshotRepository;
 import com.garment.factory.repository.StyleRepository;
 import com.garment.factory.repository.WorkOrderRepository;
 
 /**
  * 定制订单：向导式下单 + 状态流转 + 定金尾款。
+ * 尺寸口径：下单时冻结量体快照（OrderSnapshotService），看板/详情/工序只读快照。
  */
 @Service
 public class OrderService {
@@ -52,12 +56,15 @@ public class OrderService {
     private final MeasurementService measurementService;
     private final WorkOrderService workOrderService;
     private final FittingIssueService fittingIssueService;
+    private final OrderSnapshotService snapshotService;
+    private final OrderMeasurementSnapshotRepository orderSnapshotRepository;
 
     public OrderService(CustomOrderRepository orderRepository, CustomerRepository customerRepository,
                         StyleRepository styleRepository, FabricRepository fabricRepository,
                         MeasurementRepository measurementRepository, WorkOrderRepository workOrderRepository,
                         MeasurementService measurementService, WorkOrderService workOrderService,
-                        FittingIssueService fittingIssueService) {
+                        FittingIssueService fittingIssueService, OrderSnapshotService snapshotService,
+                        OrderMeasurementSnapshotRepository orderSnapshotRepository) {
         this.orderRepository = orderRepository;
         this.customerRepository = customerRepository;
         this.styleRepository = styleRepository;
@@ -67,20 +74,40 @@ public class OrderService {
         this.measurementService = measurementService;
         this.workOrderService = workOrderService;
         this.fittingIssueService = fittingIssueService;
+        this.snapshotService = snapshotService;
+        this.orderSnapshotRepository = orderSnapshotRepository;
     }
 
     // ---------------- 列表 / 看板 ----------------
 
-    @Transactional(readOnly = true)
+    @Transactional
     public SliceView<OrderListItemDto> list(String status, Long customerId, String keyword, int page, int size) {
-        Slice<OrderListItemDto> slice = orderRepository.sliceBy(trim(status), customerId, trim(keyword),
-                PageRequest.of(page, size));
+        PageRequest pageable = PageRequest.of(page, size);
+        Slice<OrderListItemDto> slice = orderRepository.sliceBy(trim(status), customerId, trim(keyword), pageable);
+        // 旧订单惰性补齐快照：补齐后重查，所有读路径都只展示冻结结果，不会回退实时量体记录
+        if (slice.getContent().stream().anyMatch(row -> row.getMeasurementSnapshot() == null)) {
+            slice.getContent().stream()
+                    .filter(row -> row.getMeasurementSnapshot() == null)
+                    .map(OrderListItemDto::getId)
+                    .distinct()
+                    .forEach(snapshotService::getOrBackfill);
+            slice = orderRepository.sliceBy(trim(status), customerId, trim(keyword), pageable);
+        }
         return SliceView.of(slice);
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public Map<String, Object> board() {
         List<OrderBoardCardDto> cards = orderRepository.findBoardCards();
+        // 看板与详情/工序同一口径：缺快照的旧订单当场补齐（待核对也在此落定），补齐后重查杜绝版本不一致
+        if (cards.stream().anyMatch(card -> card.getMeasurementSnapshot() == null)) {
+            cards.stream()
+                    .filter(card -> card.getMeasurementSnapshot() == null)
+                    .map(OrderBoardCardDto::getId)
+                    .distinct()
+                    .forEach(snapshotService::getOrBackfill);
+            cards = orderRepository.findBoardCards();
+        }
         Map<Long, long[]> progress = new LinkedHashMap<>();
         for (OrderBoardCardDto card : cards) {
             long total = workOrderRepository.countByOrderId(card.getId());
@@ -110,9 +137,31 @@ public class OrderService {
         return result;
     }
 
-    @Transactional(readOnly = true)
-    public CustomOrder detail(Long id) {
-        return orderRepository.findById(id).orElseThrow(() -> new BizException("订单不存在"));
+    @Transactional
+    public Map<String, Object> detail(Long id) {
+        CustomOrder order = orderRepository.findById(id).orElseThrow(() -> new BizException("订单不存在"));
+        OrderMeasurementSnapshotDto snapshot = snapshotService.getOrBackfill(id);
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("id", order.getId());
+        view.put("orderNo", order.getOrderNo());
+        view.put("customerId", order.getCustomerId());
+        view.put("styleId", order.getStyleId());
+        view.put("fabricId", order.getFabricId());
+        view.put("measurementId", order.getMeasurementId());
+        view.put("usageMeters", order.getUsageMeters());
+        view.put("orderDate", order.getOrderDate());
+        view.put("deliveryDate", order.getDeliveryDate());
+        view.put("fabricCost", order.getFabricCost());
+        view.put("craftFee", order.getCraftFee());
+        view.put("totalPrice", order.getTotalPrice());
+        view.put("deposit", order.getDeposit());
+        view.put("balance", order.getBalance());
+        view.put("depositPaid", order.getDepositPaid());
+        view.put("balancePaid", order.getBalancePaid());
+        view.put("status", order.getStatus());
+        view.put("remark", order.getRemark());
+        view.put("measurementSnapshot", snapshot);
+        return view;
     }
 
     @Transactional(readOnly = true)
@@ -187,13 +236,21 @@ public class OrderService {
                     + today.plusDays(GarmentDict.MIN_LEAD_DAYS));
         }
 
-        // 第 2 步：可用已有量体记录，也可现场新录一条
+        // 第 2 步：可用已有量体记录，也可现场新录一条。
+        // 已有记录必须持行锁读取，并校验页面选中时的版本号：
+        //   - 与并发删除竞争：删除事务拿不到行锁，且删除前服务端会拦截未交付引用，绝不会留下悬空订单；
+        //   - 与并发编辑竞争：版本不一致直接 409 要求重新选择，一致则冻结的就是编辑前被确认的那版尺寸。
         Measurement measurement = null;
         if (req.getMeasurementId() != null) {
-            measurement = measurementRepository.findById(req.getMeasurementId())
-                    .orElseThrow(() -> new BizException("量体记录不存在"));
+            measurement = measurementRepository.findByIdForUpdate(req.getMeasurementId())
+                    .orElseThrow(() -> new BizException("量体记录不存在或已被删除，请重新选择量体记录"));
             if (!measurement.getCustomerId().equals(customer.getId())) {
                 throw new BizException("量体记录不属于该客户，请重新选择");
+            }
+            if (req.getMeasurementVersion() != null
+                    && !req.getMeasurementVersion().equals(measurement.getVersion())) {
+                throw new ConflictException("选中的量体记录「" + measurement.getRecordNo()
+                        + "」在下单期间已被他人修改，请刷新量体列表并重新选择后再下单");
             }
         } else if (req.getMeasurement() != null) {
             MeasurementSaveReq msr = req.getMeasurement();
@@ -229,6 +286,9 @@ public class OrderService {
         order.setStatus("ORDERED");
         order.setRemark(req.getRemark());
         CustomOrder saved = orderRepository.save(order);
+        // 订单行落库后立刻在同一事务内冻结完整量体快照；任一步失败整体回滚，
+        // 不会出现「订单已创建却快照只写了一半」的中间态。
+        snapshotService.freezeForNewOrder(saved, measurement);
 
         // 扣减面料库存 + 按标准工序自动生成待开工工单
         fabricRepository.restock(fabric.getId(), usage.negate());
@@ -278,6 +338,12 @@ public class OrderService {
     }
 
     private void checkPrerequisite(CustomOrder order, String next) {
+        // 任何状态推进前，尺寸事实必须可用：待核对（原量体记录缺失）的订单禁止推进，
+        // 必须先在订单看板完成人工核对，杜绝拿不到尺寸的订单流入裁剪/缝制。
+        OrderMeasurementSnapshotDto snap = snapshotService.getOrBackfill(order.getId());
+        if (snap.isPendingVerify()) {
+            throw new BizException("该订单量体尺寸待核对（原量体记录已缺失），请先在订单看板人工核对补齐后再推进");
+        }
         switch (next) {
             case "MEASURED" -> {
                 if (order.getMeasurementId() == null) {
@@ -359,6 +425,8 @@ public class OrderService {
         if (!workOrders.isEmpty()) {
             workOrderRepository.deleteAll(workOrders);
         }
+        // 撤销下单：冻结快照一并删除（量体记录本身保留，仍可被其它订单/重新下单使用）
+        orderSnapshotRepository.findByOrderId(id).ifPresent(orderSnapshotRepository::delete);
         orderRepository.delete(order);
     }
 

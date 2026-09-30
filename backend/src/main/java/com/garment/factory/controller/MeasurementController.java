@@ -1,6 +1,7 @@
 package com.garment.factory.controller;
 
 import java.util.List;
+import java.util.Map;
 
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -49,6 +50,12 @@ public class MeasurementController {
     @GetMapping("/{id}")
     public ApiResponse<Measurement> detail(@PathVariable Long id) {
         return ApiResponse.success(measurementService.detail(id));
+    }
+
+    /** 记录被哪些订单使用：编辑前提示、删除前阻断说明的服务端数据源 */
+    @GetMapping("/{id}/usage")
+    public ApiResponse<Map<String, Object>> usage(@PathVariable Long id) {
+        return ApiResponse.success(measurementService.usage(id));
     }
 
     @GetMapping("/tailors")
